@@ -1,0 +1,12 @@
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+.runtime/
+results/
+.env
+.env.*
+*.dpapi
+*.sqlite3
+*.sqlite3-*
+openai-key*
