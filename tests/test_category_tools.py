@@ -203,5 +203,79 @@ class TestCategoryTools(unittest.TestCase):
         self.assertIn('DH{test}', res)
 
 
+
+    def test_predict_mongodb_objectids(self):
+        from ctf_category_tools import predict_mongodb_objectids, analyze_mongodb_objectids
+        sample_json = """
+        [
+          {"_id":"6ae44f712c947927537cc280","title":"Hello","author":"guest","secret":false,"publish_date":"2026-10-30T08:04:01.982Z"},
+          {"_id":"6ae44f752c947927537cc281","title":"Mongo","author":"guest","secret":false,"publish_date":"2026-10-30T08:04:05.991Z"},
+          {"_id":null,"title":"FLAG","author":"admin","secret":true,"publish_date":"2026-10-30T08:04:08.992Z"},
+          {"_id":"6ae44f7d2c947927537cc283","title":"Good","author":"guest","secret":false,"publish_date":"2026-10-30T08:04:13.993Z"}
+        ]
+        """
+        preds = predict_mongodb_objectids(sample_json)
+        self.assertEqual(preds[0], "6ae44f782c947927537cc282")
+        diag = analyze_mongodb_objectids(sample_json, "/api/board/<OID>")
+        self.assertIn("6ae44f782c947927537cc282", diag)
+        self.assertIn("MongoDB < 4.0.0", diag)
+
+    def test_predict_objectid_via_case(self):
+        sample_json = """
+        [
+          {"_id":"6ae44f752c947927537cc281","title":"Mongo","author":"guest","secret":false,"publish_date":"2026-10-30T08:04:05.991Z"},
+          {"_id":null,"title":"FLAG","author":"admin","secret":true,"publish_date":"2026-10-30T08:04:08.992Z"},
+          {"_id":"6ae44f7d2c947927537cc283","title":"Good","author":"guest","secret":false,"publish_date":"2026-10-30T08:04:13.993Z"}
+        ]
+        """
+        case = helper.Case("Objectid test", [])
+        res = case.call_tool("predict_objectid", {"data": sample_json, "endpoint_template": "/api/board/:board_id"})
+        self.assertIn("6ae44f782c947927537cc282", res)
+
+    def test_http_get_mongodb_objectid_auto_detection(self):
+        import http.server
+        import threading
+        import json
+
+        sample_board = json.dumps([
+            {"_id":"6ae44f752c947927537cc281","title":"Mongo","author":"guest","secret":False,"publish_date":"2026-10-30T08:04:05.991Z"},
+            {"_id":None,"title":"FLAG","author":"admin","secret":True,"publish_date":"2026-10-30T08:04:08.992Z"},
+            {"_id":"6ae44f7d2c947927537cc283","title":"Good","author":"guest","secret":False,"publish_date":"2026-10-30T08:04:13.993Z"}
+        ])
+
+        class MockHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/board":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(sample_board.encode())
+                elif self.path == "/api/board/6ae44f782c947927537cc282":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    doc = {"_id": "6ae44f782c947927537cc282", "title": "FLAG", "body": "DH{test_mongo_auto_probed_flag}"}
+                    self.wfile.write(json.dumps(doc).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), MockHandler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+
+        try:
+            case = helper.Case("Mongo auto-probe test", [], tcp_endpoint=f"http://127.0.0.1:{port}/")
+            res = case.call_tool("http_get", {"path": "/api/board"})
+            self.assertIn("6ae44f782c947927537cc282", res)
+            self.assertIn("DH{test_mongo_auto_probed_flag}", res)
+            self.assertTrue(any("DH{test_mongo_auto_probed_flag}" in item["flag"] for item in case.evidence))
+        finally:
+            server.shutdown()
+
+
 if __name__ == '__main__':
     unittest.main()

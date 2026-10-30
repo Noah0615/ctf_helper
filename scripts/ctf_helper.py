@@ -290,6 +290,8 @@ TOOLS = [
                 {"name": {"type": "string"}}, ["name"]),
     tool_schema("craft_prompt_injections", "Generate battle-tested prompt injection and jailbreak payloads (direct override, refusal suppression, encoding bypass, delimiter escape) for LLM CTF targets",
                 {"goal": {"type": "string"}, "defense_hint": {"type": "string"}, "target_service": {"type": "string"}}, []),
+    tool_schema("predict_objectid", "Analyze a JSON array or text of MongoDB documents to predict hidden/secret document ObjectIds by interpolating timestamps, machine IDs, and sequential counters (MongoDB < 4.0.0)",
+                {"data": {"type": "string"}, "endpoint_template": {"type": "string"}}, ["data"]),
     tool_schema("craft_pickle_exploit", "Generate PyTorch / Pickle deserialization RCE exploit payloads (using __reduce__) for CTF challenges where torch.load or pickle.loads is executed",
                 {"command": {"type": "string"}}, []),
 ]
@@ -1075,6 +1077,11 @@ class Case:
                 result = craft_prompt_injections(str(args.get("goal", "leak_flag")),
                                                 str(args.get("defense_hint", "")),
                                                 str(args.get("target_service", "http")))
+            elif name == "predict_objectid":
+                from ctf_category_tools import analyze_mongodb_objectids
+                data_in = str(args.get("data", ""))
+                tpl = str(args.get("endpoint_template", ""))
+                result = analyze_mongodb_objectids(data_in, endpoint_template=tpl)
             elif name == "craft_pickle_exploit":
                 from ctf_ai_security import craft_pickle_exploit
                 result = craft_pickle_exploit(str(args.get("command", "cat flag")))
@@ -1222,6 +1229,24 @@ class Case:
             failure = f"문제 웹 요청 실패: {type(exc).__name__}"
             self._log_exchange("GET", path, req_headers, "", failure)
             return failure
+        # Check for MongoDB ObjectId sequences in JSON responses (e.g. hidden secret boards)
+        if status == 200 and ("_id" in body or "ObjectId" in body):
+            try:
+                from ctf_category_tools import analyze_mongodb_objectids, predict_mongodb_objectids
+                pred_oids = predict_mongodb_objectids(body)
+                if pred_oids:
+                    diag = analyze_mongodb_objectids(body, endpoint_template=f"{path.rstrip('/')}/<OID>")
+                    full_resp += f"\n\n{diag}"
+                    top_cand = pred_oids[0]
+                    probe_path = f"{path.rstrip('/')}/{top_cand}"
+                    probe_req = Request(self.web_origin + probe_path, headers=req_headers, method="GET")
+                    with opener.open(probe_req, timeout=5) as p_resp:
+                        if p_resp.status == 200:
+                            p_body = self._http_get_body(probe_path, p_resp.read(MAX_FILE_BYTES + 1))
+                            full_resp += f"\n\n[MongoDB ObjectId 자동 검증 성공]\n- 예측된 경로: {probe_path}\n- 응답 데이터:\n{p_body[:600]}"
+                            self._record_flags(p_body, f"문제 웹 응답: {probe_path}")
+            except Exception:
+                pass
         self._log_exchange("GET", path, req_headers, "", full_resp)
         # ZIP entries were recorded with their precise archive path above.
         self._record_flags(headers_str if body.startswith("ZIP 파일 저장:") else full_resp,
@@ -1566,7 +1591,7 @@ class Case:
             "For forensics use analyze_binary, inspect_archive, and read_archive_entry. For crypto, use decode_text, extract_crypto_params (which breaks LFSR stream ciphers, Byte-Caesar, and XOR), and offline Python calculations. For AI security (ai-security), use inspect_ai_model to check SafeTensors/GGUF metadata and PyTorch/pickle bytecode for hidden flags or RCE; use craft_prompt_injections for LLM jailbreak and system prompt extraction; use craft_pickle_exploit for torch.load / pickle.loads targets. "
             "If /flag exists only on the remote server and its output is unavailable, state that the exact flag is unknown. "
             "Use HTTP tools only for the explicitly supplied CTF web origin. For a source-proven finite prefix or integer oracle, "
-            "call http_prefix_oracle or http_integer_oracle to complete the search and inspect the actual response; do not stop at a sample script. "
+            "call http_prefix_oracle or http_integer_oracle to complete the search and inspect the actual response; do not stop at a sample script. In web exploitation challenges, when a live web server is provided, you MUST call http_get in Turn 1 on the base URL and main API endpoints (e.g. /, /api/board) to observe actual server behavior. If a JSON response contains MongoDB ObjectIds with hidden/null IDs, use predict_objectid or test sequential ObjectIds by interpolating the 4-byte timestamp and 3-byte counter. "
             "If a CTF TCP endpoint was explicitly supplied, use tcp_exchange to interact with it. "
             "When using tcp_exchange: "
             "1. tcp_exchange automatically receives the initial banner/prompt upon connecting. NEVER pass an empty string '' as step 0. "
@@ -1644,7 +1669,13 @@ class Case:
                         self.evidence.append(record)
 
             if not content and thinking:
-                content = f"[?? ?? ??]\n{thinking[-1500:]}"
+                content = f"[추론 사고 요약]\n{thinking[-1500:]}"
+            if not calls and (not msg.get("content") or msg.get("content").strip() == ""):
+                no_call_retries += 1
+                if no_call_retries >= 1 and self.web_origin:
+                    messages.append({"role": "user", "content": "사고 과정만 진행되었고 도구 호출이 발생하지 않았습니다. 가설 검증을 위해 즉시 적절한 도구(예: http_get 등)를 호출하여 실제 서버 응답을 확인하세요."})
+            else:
+                no_call_retries = 0
 
             if content:
                 for flag in extract_flags(content, self.pattern):

