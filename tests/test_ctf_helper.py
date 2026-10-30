@@ -145,6 +145,17 @@ class HelperTests(unittest.TestCase):
         case = helper.Case(description, files, allow_mismatch=True)
         self.assertEqual(case.category, "auto")
 
+    def test_css_and_js_braces_do_not_trigger_flag_format_mismatch(self):
+        files = [
+            ("challenge/deploy/app.py", b'FLAG = os.environ.get("FLAG")\n'),
+            ("challenge/deploy/static/css/bootstrap.css",
+             b'.container{width:100%}.navbar{display:block}.FLAG{color:red}.warning{padding:0}'),
+            ("challenge/deploy/static/js/bootstrap.js", b'function toggle(){return true;}'),
+            ("challenge/notes.txt", b'OTHER{not_a_declared_flag_format}'),
+        ]
+        case = helper.Case("플래그 형식은 DH{...} 입니다.", files)
+        self.assertIn("challenge/deploy/app.py", case.list_files())
+
     def test_tcp_banner_flag_is_observed_but_does_not_skip_analysis(self):
         case = helper.Case("형식 DH{...}", [], tcp_endpoint="ctf.example:1234")
         conn = MagicMock()

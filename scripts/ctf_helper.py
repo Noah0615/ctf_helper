@@ -40,7 +40,9 @@ DECLARED_FLAG_FORMAT = re.compile(
     r"(?:flag\s*format|플래그(?:의)?\s*형식)\s*(?:[:：은는]\s*)?[`* ]*([A-Za-z][A-Za-z0-9_]{1,23})\s*\{",
     re.IGNORECASE,
 )
-FILE_FLAG_PREFIX = re.compile(rb"\b([A-Za-z][A-Za-z0-9_]{1,23})\{[^}\r\n]{1,160}\}")
+# The mismatch guard must not mistake CSS selectors such as .container{...} for flags.
+# Unknown formats are accepted unless a file explicitly declares one below.
+FILE_FLAG_PREFIX = re.compile(rb"(?<![A-Za-z0-9_])(ACDC|FLAG|CTF|DH|APS)\{[^{};:\r\n]{1,160}\}")
 CHALLENGE_CATEGORIES = ("auto", "web", "pwn", "reversing", "crypto", "forensics", "ai-security", "cloud-web3", "other")
 PROFILES = ("general", "acdc-2026")
 ACDC_TRACKS = ("auto", "ai-for-security", "security-for-ai", "ai-platform-security")
@@ -127,8 +129,12 @@ def flag_format_conflict(description: str, files: list[tuple[str, bytes]]) -> st
     for _, data in files:
         if not is_text(data):
             continue
-        found.update(match.group(1).decode("ascii", errors="ignore").upper()
-                     for match in FILE_FLAG_PREFIX.finditer(data[:200_000]))
+        sample = data[:200_000]
+        found.update(match.group(1).decode("ascii").upper()
+                     for match in FILE_FLAG_PREFIX.finditer(sample))
+        text = sample.decode("utf-8", errors="replace")
+        found.update(match.group(1).upper()
+                     for match in DECLARED_FLAG_FORMAT.finditer(text))
     if found and declared.isdisjoint(found):
         return (f"문제 설명의 Flag 형식은 {', '.join(sorted(declared))}인데 첨부 파일에는 "
                 f"{', '.join(sorted(found))} 형식만 보입니다. 서로 다른 문제의 파일인지 확인하세요. "
