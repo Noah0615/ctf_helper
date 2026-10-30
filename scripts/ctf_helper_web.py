@@ -63,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ready": ollama_ready,
                     "model": DEFAULT_MODEL,
                     "error": ollama_error,
+                    "think_modes": ["quick", "deep"],
                 },
                 "openai": {
                     "ready": has_key,
@@ -99,20 +100,41 @@ class Handler(BaseHTTPRequestHandler):
             job_id = self.path.removeprefix("/api/job/")
             with LOCK:
                 job = JOBS.get(job_id)
-                snapshot = None if job is None else {**job, "events": list(job["events"])}
+                snapshot = None
+                if job is not None:
+                    snapshot = {
+                        "status": job["status"],
+                        "events": list(job["events"]),
+                        "result": job["result"],
+                        "error": job["error"],
+                    }
+                    case_obj = job.get("case")
+                    if case_obj is not None:
+                        if hasattr(case_obj, "state"):
+                            snapshot["hypotheses"] = [h.to_dict() for h in case_obj.state.hypotheses]
+                            snapshot["budgets"] = dict(case_obj.state.budgets)
+                        if hasattr(case_obj, "metrics"):
+                            snapshot["metrics"] = case_obj.metrics.to_dict()
             if not snapshot:
                 saved = RESULTS / job_id / "result.json"
                 if saved.is_file():
                     try:
                         res = json.loads(saved.read_text(encoding="utf-8"))
-                        snapshot = {"status": "done", "events": ["저장된 분석 결과 불러옴"], "result": res, "error": None}
+                        snapshot = {
+                            "status": "done",
+                            "events": ["저장된 분석 결과 불러옴"],
+                            "result": res,
+                            "error": None,
+                            "hypotheses": res.get("hypotheses", []),
+                            "metrics": res.get("metrics", {}),
+                        }
                     except Exception:
                         pass
             return self._reply(200, snapshot) if snapshot else self._reply(404, {"error": "실행 기록 없음"})
         return self._reply(404, {"error": "경로 없음"})
 
     def do_POST(self):
-        if self.path not in {"/api/solve", "/api/continue"} or not self._local_request():
+        if self.path not in {"/api/solve", "/api/continue", "/api/pause", "/api/resume"} or not self._local_request():
             return self._reply(404, {"error": "경로 없음"})
         if self.headers.get("Origin") not in {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}:
             return self._reply(403, {"error": "로컬 화면에서만 제출하세요."})
@@ -123,7 +145,19 @@ class Handler(BaseHTTPRequestHandler):
             if not 1 <= length <= max_length:
                 raise ValueError("요청 크기가 너무 큽니다.")
             body = json.loads(self.rfile.read(length))
+
+            if self.path in {"/api/pause", "/api/resume"}:
+                job_id = str(body.get("job_id") or "")
+                with LOCK:
+                    job = JOBS.get(job_id)
+                    if not job:
+                        return self._reply(404, {"error": "해당 작업을 찾을 수 없습니다."})
+                    job["status"] = "paused" if self.path == "/api/pause" else "running"
+                    job["events"].append("작업이 일시중지되었습니다." if self.path == "/api/pause" else "작업이 재개되었습니다.")
+                return self._reply(200, {"status": job["status"], "job_id": job_id})
+
             model = str(body.get("model") or DEFAULT_MODEL)
+            think_mode = str(body.get("think_mode") or "quick")
             if model != DEFAULT_MODEL and model not in OPENAI_MODELS:
                 raise ValueError(f"지원되지 않는 모델입니다: {model}")
             if self.path == "/api/continue":
@@ -156,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
                             challenge_mode=str(body.get("challenge_mode") or "ctf"))
         except (ValueError, KeyError, TypeError, binascii.Error, json.JSONDecodeError) as exc:
             return self._reply(400, {"error": str(exc)})
-        job = {"status": "queued", "events": [], "result": None, "error": None}
+        job = {"status": "queued", "events": [], "result": None, "error": None, "case": case}
         with LOCK:
             JOBS[case.id] = job
 
@@ -170,7 +204,7 @@ class Handler(BaseHTTPRequestHandler):
                     job["status"] = "running"
                 case.event = update
                 try:
-                    result = case.solve(model=model)
+                    result = case.solve(model=model, think_mode=think_mode)
                     with LOCK:
                         job["result"] = result
                         job["status"] = "done"

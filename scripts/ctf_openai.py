@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
-import os
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 import uuid
 
 try:
@@ -15,6 +16,8 @@ except ImportError:
 
 from ctf_helper import ROOT, TOOLS, is_text
 
+KEY_FILE = ROOT / ".runtime" / "juice-openai" / "openai-key.dpapi"
+KEY_SCRIPT = ROOT / "scripts" / "juice" / "Read-ProtectedKey.ps1"
 LEDGER_FILE = ROOT / ".runtime" / "ctf-helper" / "openai-usage.sqlite3"
 MODELS = {
     "gpt-5.4-mini": {"input": .75, "cached": .075, "output": 4.50},
@@ -27,13 +30,23 @@ RETRY_MAX_OUTPUT_TOKENS = 25000
 
 
 def key_present() -> bool:
-    return bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    return KEY_FILE.is_file() and KEY_SCRIPT.is_file()
 
 
 def load_key() -> str:
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not key or any(c.isspace() for c in key):
-        raise RuntimeError("OPENAI_API_KEY 환경 변수를 설정하세요.")
+    if not key_present():
+        raise RuntimeError("보호된 OpenAI 키가 없습니다. scripts/juice/Set-OpenAIKey.ps1로 저장하세요.")
+    shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+    if not shell:
+        raise RuntimeError("PowerShell 실행 파일을 찾을 수 없습니다.")
+    try:
+        proc = subprocess.run([shell, "-NoProfile", "-File", str(KEY_SCRIPT)],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("보호된 OpenAI 키를 읽지 못했습니다.") from exc
+    key = proc.stdout.strip()
+    if proc.returncode or not key.startswith("sk-") or any(c.isspace() for c in key):
+        raise RuntimeError("보호된 OpenAI 키를 복호화하지 못했습니다. 저장한 Windows 사용자 계정을 확인하세요.")
     return key
 
 
@@ -142,7 +155,7 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
     if model not in MODELS:
         raise ValueError("허용된 GPT 모델: " + ", ".join(MODELS))
     if OpenAI is None:
-        raise RuntimeError("openai 패키지가 없습니다. pip install -r requirements.txt를 실행하세요.")
+        raise RuntimeError("이 Python 환경에 openai 패키지가 없습니다. .venv_pentestgpt를 사용하세요.")
     key = load_key()
     ledger = BudgetLedger()
     client = OpenAI(api_key=key, timeout=180, max_retries=0)

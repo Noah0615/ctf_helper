@@ -289,6 +289,44 @@ async function poll(id) {
        : others.length ? '분석 완료 · 미검증 후보 발견' : '분석 완료 · 정확한 flag 미확인')
     : r.status === 'running' ? '분석 진행 중…' : `상태: ${r.status}`;
   $('events').textContent = (r.events || []).join('\n');
+
+  // Handle pause / resume buttons
+  const pauseBtn = $('pause-btn');
+  const resumeBtn = $('resume-btn');
+  if (r.status === 'running') {
+    if (pauseBtn) { pauseBtn.style.display = 'inline-block'; pauseBtn.disabled = false; }
+    if (resumeBtn) { resumeBtn.style.display = 'none'; }
+  } else if (r.status === 'paused') {
+    if (pauseBtn) { pauseBtn.style.display = 'none'; }
+    if (resumeBtn) { resumeBtn.style.display = 'inline-block'; resumeBtn.disabled = false; }
+  } else {
+    if (pauseBtn) pauseBtn.style.display = 'none';
+    if (resumeBtn) resumeBtn.style.display = 'none';
+  }
+
+  // Display hypotheses if present
+  const hypList = r.hypotheses || r.result?.hypotheses;
+  if (hypList && hypList.length) {
+    const box = $('hypotheses-box');
+    const list = $('hypotheses-list');
+    if (box && list) {
+      box.style.display = 'block';
+      list.replaceChildren();
+      for (const h of hypList) {
+        const d = document.createElement('div');
+        d.className = 'hyp-item';
+        const badge = document.createElement('span');
+        badge.className = `hyp-status status-${h.status || 'pending'}`;
+        badge.textContent = (h.status || 'pending').toUpperCase();
+        const titleSpan = document.createElement('strong');
+        titleSpan.textContent = (h.title || '') + ' ';
+        const descSpan = document.createElement('span');
+        descSpan.textContent = `(도구: ${h.next_tool} | 사유: ${h.reason})`;
+        d.append(badge, titleSpan, descSpan);
+        list.append(d);
+      }
+    }
+  }
   if (r.status === 'done') {
     $('flags').replaceChildren();
     function addGroup(title, group, kind = 'candidate') {
@@ -445,6 +483,7 @@ $('form').addEventListener('submit', async event => {
         description: $('description').value,
         files,
         model: $('model').value,
+        think_mode: $('think-mode') ? $('think-mode').value : 'quick',
         category: $('category').value,
         profile: $('profile').value,
         track: $('track').value,
@@ -493,3 +532,32 @@ $('continue-btn').addEventListener('click', async () => {
 
 health();
 loadHistory();
+
+$('pause-btn')?.addEventListener('click', async () => {
+  if (!activeJobId) return;
+  try {
+    await fetch('/api/pause', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({job_id: activeJobId})
+    });
+  } catch (e) {}
+});
+
+$('resume-btn')?.addEventListener('click', async () => {
+  if (!activeJobId) return;
+  try {
+    await fetch('/api/resume', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({job_id: activeJobId})
+    });
+  } catch (e) {}
+});
+
+$('model')?.addEventListener('change', () => {
+  const isOllama = $('model').value.startsWith('lab-') || $('model').value.startsWith('qwen');
+  if ($('think-mode-container')) {
+    $('think-mode-container').style.display = isOllama ? 'block' : 'none';
+  }
+});

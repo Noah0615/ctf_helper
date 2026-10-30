@@ -46,11 +46,17 @@
     details { margin: 0.8rem 0; }
     details summary { cursor: pointer; color: #9bb7d4; font-size: 0.9rem; font-weight: 600; user-select: none; }
     .result-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
+    .hyp-item { background: #0e1724; border-left: 3px solid #3b82f6; padding: 0.4rem 0.8rem; margin: 0.35rem 0; border-radius: 0 4px 4px 0; }
+    .hyp-status { display: inline-block; font-size: 0.75rem; padding: 0.15rem 0.4rem; border-radius: 4px; font-weight: 700; margin-right: 0.4rem; }
+    .status-testing { background: #1e3a8a; color: #93c5fd; }
+    .status-confirmed { background: #064e3b; color: #6ee7b7; }
+    .status-refuted { background: #7f1d1d; color: #fca5a5; }
+    .status-abandoned { background: #374151; color: #9ca3af; }
   </style>
 </head>
 <body>
   <h1>CTF 풀이 도우미</h1>
-  <p class="sub">로컬 Qwen3 8B / OpenAI Responses API · 문제 설명 및 다중 분야 정적 분석</p>
+  <p class="sub">로컬 Qwen3 8B / OpenAI Responses API · 상태 기반 자율 분석 &amp; 목표 검증 (v2.0)</p>
   <div class="top-bar" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem; margin:0.8rem 0;">
     <div class="health-bar" style="margin:0;">
       <span id="health-ollama" class="health-pill">Ollama 확인 중…</span>
@@ -65,11 +71,20 @@
   <form id="form">
     <label for="model">분석 모델 선택</label>
     <select id="model">
-      <option value="qwen3:8b">로컬 Qwen3 8B (무료 · 로컬 실행)</option>
+      <option value="lab-qwen3-8b-16k:locked">로컬 Qwen3 8B (무료 · 로컬 오프라인)</option>
       <option value="gpt-5.4-mini">OpenAI GPT-5.4 Mini (빠르고 경제적 · Responses API)</option>
       <option value="gpt-5.4">OpenAI GPT-5.4 (심층 추론 · Responses API)</option>
     </select>
     <p class="note">GPT 모델 선택 시 문제 설명과 파일 내용이 OpenAI API로 전송됩니다. 표시 금액은 도구 한도이며 OpenAI 계정 잔액은 아닙니다.</p>
+
+    <div id="think-mode-container" style="margin-top: 0.8rem;">
+      <label for="think-mode">로컬 Qwen3 8B 추론 모드 (사고 및 탐색 전략)</label>
+      <select id="think-mode">
+        <option value="quick">빠른 분석 (Quick · think=off, temperature=0, 빠른 도구 탐색)</option>
+        <option value="deep">심층 추론 (Deep · think=on, temperature=0.6, 체계적 가설 검증)</option>
+      </select>
+      <p class="note">심층 추론 모드는 Qwen3 8B의 내부 사고 모드를 켜서 복잡한 실패 원인 및 역공학 가설을 깊게 추론합니다.</p>
+    </div>
 
     <label for="category">CTF 분야</label>
     <select id="category">
@@ -143,10 +158,20 @@
   <section id="result" hidden>
     <div class="result-header">
       <h2>진행 및 결과</h2>
-      <button id="copy-report-btn" type="button" class="copy-btn">전체 결과 복사</button>
+      <div style="display:flex; gap:0.5rem; align-items:center;">
+        <button id="pause-btn" type="button" class="btn-secondary" style="display:none; padding:0.35rem 0.75rem; font-size:0.85rem;">일시중지</button>
+        <button id="resume-btn" type="button" class="btn-secondary" style="display:none; padding:0.35rem 0.75rem; font-size:0.85rem;">재개</button>
+        <button id="copy-report-btn" type="button" class="copy-btn">전체 결과 복사</button>
+      </div>
     </div>
     <div id="cost" class="cost-badge" hidden></div>
     <p id="status"></p>
+
+    <div id="hypotheses-box" style="margin: 0.6rem 0; padding: 0.8rem; background: #121c2a; border-radius: 8px; border: 1px solid #23344a; display:none;">
+      <h4 style="margin: 0 0 0.4rem; color: #a9c5e2; font-size: 0.95rem;">가설 및 분석 상태 (v2.0)</h4>
+      <div id="hypotheses-list" style="font-size: 0.88rem; color: #cbd9e8;"></div>
+    </div>
+
     <div id="flags"></div>
     <pre id="answer"></pre>
     <details id="solutions-details" hidden>

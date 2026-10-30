@@ -26,14 +26,18 @@ class HelperTests(unittest.TestCase):
         self.patch_results.start()
         self.addCleanup(self.patch_results.stop)
 
-    def test_openai_key_is_read_from_environment(self):
-        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test-only"}):
-            self.assertTrue(openai_helper.key_present())
-            self.assertEqual(openai_helper.load_key(), "sk-test-only")
-        with patch.dict("os.environ", {"OPENAI_API_KEY": ""}):
+    def test_local_dpapi_key_detection_and_loading(self):
+        key_file = Path(self.temp.name) / "dummy-key.dpapi"
+        key_script = Path(self.temp.name) / "dummy-reader.ps1"
+        with patch.object(openai_helper, "KEY_FILE", key_file), patch.object(openai_helper, "KEY_SCRIPT", key_script):
             self.assertFalse(openai_helper.key_present())
-            with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
-                openai_helper.load_key()
+            key_file.write_bytes(b"dummy")
+            key_script.write_text("# dummy", encoding="utf-8")
+            self.assertTrue(openai_helper.key_present())
+            with patch.object(openai_helper.shutil, "which", return_value="powershell.exe"), \
+                 patch.object(openai_helper.subprocess, "run", return_value=SimpleNamespace(
+                     returncode=0, stdout="sk-test-only", stderr="")):
+                self.assertEqual(openai_helper.load_key(), "sk-test-only")
 
     def test_rejects_paths_and_duplicate_names_before_creation(self):
         with self.assertRaises(ValueError):

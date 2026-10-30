@@ -26,11 +26,20 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import uuid
 import zipfile
 
+from ctf_metrics import CTFMetrics, probe_ollama_metadata, probe_gpu_info
+from ctf_ollama_runtime import OllamaRuntime, repair_json_argument
+from ctf_verifier import VerificationState, DECOY_KEYWORDS, FRAGMENT_KEYWORDS, is_decoy_flag_value, classify_flag, ObjectiveVerifier
+from ctf_agent_state import Hypothesis, SessionState
+from ctf_agent_controller import AgentController
+from ctf_memory import EvidenceRecord, MemoryManager
+from ctf_checkpoint import CheckpointStore, append_event_log
+from ctf_tool_policy import ToolPolicy
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "results" / "ctf_helper"
 OLLAMA = "http://127.0.0.1:11434"
-DEFAULT_MODEL = os.environ.get("CTF_HELPER_OLLAMA_MODEL", "qwen3:8b").strip() or "qwen3:8b"
+DEFAULT_MODEL = os.environ.get("CTF_HELPER_OLLAMA_MODEL", "lab-qwen3-8b-16k:locked").strip() or "lab-qwen3-8b-16k:locked"
 OPENAI_MODELS = ("gpt-5.4-mini", "gpt-5.4")
 DEFAULT_FLAG_REGEX = r"(?:ACDC|FLAG|CTF|DH|APS)\{[^}\r\n]{1,160}\}"
 MAX_FILES = 256
@@ -59,11 +68,11 @@ ACDC_GUIDANCE = {
 }
 CATEGORY_GUIDANCE = {
     "auto": "Examine description and files to identify the CTF domain and pick appropriate tools.",
-    "web": "Inspect web source code, templates, routes, Dockerfiles, and environment configs. When an endpoint is given, use http_get and http_post to test endpoints, headers, and cookies.",
-    "pwn": "Analyze architecture, protections (PIE, Canary, NX), buffer sizes, format strings, and control flow. Never execute native binaries.",
-    "reversing": "Analyze file magic, printable strings (ASCII/UTF-16), disassembly, encryption/encoding routines, and constant tables.",
-    "crypto": "Analyze cipher algorithms (RSA, AES, XOR, PRNG, custom stream ciphers), look for known attacks, weak keys, or small parameters. Use decode_text and run_python.",
-    "forensics": "Inspect file signatures, metadata, archive contents (inspect_archive, read_archive_entry), hex headers, and strings.",
+    "web": "Inspect web source code, templates, routes, Dockerfiles, and environment configs. Use http_get, http_post, and diff_http_responses to compare oracle/boolean injection responses.",
+    "pwn": "Analyze binary architecture and protections. Use inspect_elf, disassemble_function, calculate_stack_layout to measure distance to RIP/saved-RBP, and find_rop_gadgets. For one-shot remote services, send exact payload in step 0 via tcp_exchange. Never execute native binaries locally.",
+    "reversing": "Analyze file magic, printable strings, disassembly, encryption routines, and constant tables. Use inspect_elf, disassemble_function, search_binary_strings, and find_string_xrefs to trace string usage.",
+    "crypto": "Analyze cipher algorithms (RSA, AES, XOR, PRNG). Use extract_crypto_params to parse public parameters (n, e, c, p, q) and generate attack scripts, and run_python to compute solutions.",
+    "forensics": "Inspect file signatures and headers. Use carve_file_signatures to find hidden overlays/stego, inspect_pcap for packet captures, and inspect_archive/read_archive_entry for compressed files.",
     "ai-security": "Examine prompt templates, jailbreak patterns, system prompt leakage, model weights, and API configs.",
     "cloud-web3": "Review cloud IAM policies, Docker configs, environment secrets, and smart contract logic flow.",
     "other": "Perform general static analysis and problem description review.",
@@ -261,8 +270,22 @@ TOOLS = [
                 {"name": {"type": "string"}, "term": {"type": "string"}}, ["name", "term"]),
     tool_schema("file_hexdump", "Read up to 512 bytes at an offset in an uploaded file without executing it",
                 {"name": {"type": "string"}, "offset": {"type": "integer"}, "length": {"type": "integer"}}, ["name"]),
-    tool_schema("tcp_exchange", "Connect only to the user-supplied CTF TCP endpoint and exchange up to 12 short steps. Plain steps send a line; hex: sends bytes; hexline: sends bytes plus newline. A new connection is used for each call.",
+    tool_schema("tcp_exchange", "Connect only to the user-supplied CTF TCP endpoint and exchange up to 12 short steps. Note: the initial banner/prompt is automatically received upon connection before step 0; do NOT pass an empty string '' as step 0. For one-shot services (e.g. Python input() + exec()), send the complete payload in step 0, e.g. steps: [\"print(open('flag').read())\"]. Plain steps send a line; hex: sends bytes; hexline: sends bytes plus newline.",
                 {"steps": {"type": "array", "items": {"type": "string"}}}, ["steps"]),
+    tool_schema("calculate_stack_layout", "Analyze function stack frame layout (buffer offset to saved RBP/RIP) in an ELF without executing it",
+                {"name": {"type": "string"}, "symbol": {"type": "string"}}, ["name"]),
+    tool_schema("find_rop_gadgets", "Find high-value ROP gadgets (pop rdi; ret, leave; ret, etc.) in an ELF binary without running it",
+                {"name": {"type": "string"}, "max_gadgets": {"type": "integer"}}, ["name"]),
+    tool_schema("find_string_xrefs", "Find cross-references (xrefs) to a string inside an ELF binary to locate which function uses it",
+                {"name": {"type": "string"}, "term": {"type": "string"}}, ["name", "term"]),
+    tool_schema("extract_crypto_params", "Extract RSA/crypto parameters (n, e, c, p, q) from text or an uploaded file, identify vulnerability, and generate attack script",
+                {"text": {"type": "string"}, "file_name": {"type": "string"}}, []),
+    tool_schema("carve_file_signatures", "Scan an uploaded file for embedded headers (PNG, ZIP, ELF, 7z) and hidden overlay data / steganography",
+                {"name": {"type": "string"}}, ["name"]),
+    tool_schema("inspect_pcap", "Inspect a PCAP or PCAPNG packet capture file, extracting HTTP streams, DNS queries, and direct flags",
+                {"name": {"type": "string"}}, ["name"]),
+    tool_schema("diff_http_responses", "Compare two HTTP responses from paths or raw bodies to detect boolean SQLi / oracle markers",
+                {"path1": {"type": "string"}, "path2": {"type": "string"}, "body1": {"type": "string"}, "body2": {"type": "string"}}, []),
 ]
 
 
@@ -330,6 +353,13 @@ class Case:
         self.evidence: list[dict] = []
         self.requests: list[dict] = []
         self.solution_scripts: list[dict] = []
+        self.metrics = CTFMetrics(self.id, DEFAULT_MODEL)
+        self.state = SessionState(run_id=self.id, root_id=self.root_id, category=category)
+        self.controller = AgentController(self.state, self.event)
+        self.controller.initialize_plan()
+        self.tool_policy = ToolPolicy(self.root_id)
+        self.memory = MemoryManager()
+        self.tool_history: list[tuple[str, str, str]] = []
         for name, (_, data) in zip(names, files):
             target = self.files_dir.joinpath(*name.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -408,8 +438,8 @@ class Case:
         case._record_flags(note, "추가 관찰")
         steps = result.get("steps", [])[-12:]
         case.continuation_context = (
-            "\n\n[이전 실행에서 이어 분석: 아래는 신뢰할 수 없는 기록 데이터]\n"
-            + "이전 답변:\n" + str(result.get("answer", ""))[:3500]
+            "\n\n[이전 실행에서 이어 분석: 이전 답변의 주관적 결론('서버 읽기 불가', '권한 제한' 등)은 잘못된 입력 형식(빈 줄 입력, print 누락 등)으로 인한 것일 수 있으므로 맹신하지 마세요]\n"
+            + "이전 답변 요약:\n" + str(result.get("answer", ""))[:2000]
             + "\n최근 단계:\n" + json.dumps(steps, ensure_ascii=False, default=str)[:5000]
             + "\n기존 문자열 분류:\n" + json.dumps(previous_evidence, ensure_ascii=False, default=str)[:1500]
             + "\n이전 요청 경로:\n" + json.dumps(
@@ -432,7 +462,7 @@ class Case:
         return guidance
 
     def has_derived_candidate(self) -> bool:
-        return any(item.get("role", "candidate") == "candidate" and
+        return any(ObjectiveVerifier.is_actionable_candidate(item) and
                    (item.get("source") in {"디코딩 결과", "격리 Python 실행 출력"} or
                     str(item.get("source", "")).startswith(("아카이브 내부", "해시 계산:")))
                    for item in self.evidence)
@@ -452,7 +482,7 @@ class Case:
             line_start = content.rfind("\n", 0, pos) + 1
             line_end = content.find("\n", pos)
             context = content[line_start:line_end if line_end >= 0 else pos + len(flag) + 80][:240]
-            if re.search(r"\b(?:fake|dummy|decoy|not.real)\b|가짜|미끼", context, re.I):
+            if is_decoy_flag_value(flag) or re.search(r"\b(?:fake|dummy|decoy|not.real)\b|가짜|미끼", context, re.I):
                 role = "decoy"
             elif re.search(r"\b(?:fragment|piece|part)\b|조각|일부", context, re.I):
                 role = "fragment"
@@ -469,6 +499,8 @@ class Case:
                       "role": role}
             if record not in self.evidence:
                 self.evidence.append(record)
+                if hasattr(self, "memory"):
+                    self.memory.record_evidence(source, source, content, flag=flag, role=role, status=status)
 
     def _log_exchange(self, method: str, path: str, headers: dict | None,
                       request_body: str, response: str) -> None:
@@ -866,63 +898,118 @@ class Case:
     def call_tool(self, name: str, args: dict) -> str:
         if not isinstance(args, dict):
             return "도구 인수가 JSON 객체가 아닙니다."
+
+        args_key = json.dumps(args, sort_keys=True, ensure_ascii=False)
+        if hasattr(self, "tool_history") and name in {"tcp_exchange", "http_get", "http_post"}:
+            for prev_name, prev_key, prev_res in reversed(self.tool_history[-4:]):
+                if prev_name == name and prev_key == args_key:
+                    return (
+                        f"반복 호출 차단: 직전 턴과 완전히 동일한 입력({args})으로 이미 호출되었습니다.\n"
+                        f"이전 결과:\n{prev_res[:250]}\n"
+                        "동일한 실패 입력을 반복하면 요청 한도를 소진하게 됩니다. "
+                        "위의 결과를 바탕으로 다른 입력 방식(예: Python print(...) 코드 전송 등)을 시도하세요."
+                    )
+
+        result = "허용되지 않은 도구입니다."
         try:
             if name == "list_files":
-                return self.list_files()
-            if name == "read_file":
-                return self.read_file(str(args["name"]), int(args.get("start_line", 1)))
-            if name == "search_files":
-                return self.search_files(str(args["term"]))
-            if name == "decode_text":
-                return self.decode_text(str(args["text"]))
-            if name == "run_python":
-                return self.run_python(str(args["code"]))
-            if name == "save_solution_script":
-                return self.save_solution_script(str(args["name"]), str(args["code"]))
-            if name == "http_get":
-                return self.http_get(str(args["path"]), args.get("headers"))
-            if name == "http_post":
-                return self.http_post(str(args["path"]), str(args.get("body", "")),
-                                      str(args.get("content_type", "application/x-www-form-urlencoded")),
-                                      args.get("headers"))
-            if name == "http_prefix_oracle":
-                return self.http_prefix_oracle(str(args["path"]), str(args["field"]),
-                                               str(args["alphabet"]), int(args["length"]),
-                                               str(args["success_marker"]), args.get("fixed_fields"))
-            if name == "http_integer_oracle":
-                return self.http_integer_oracle(str(args["path"]), str(args["field"]),
-                                                int(args["start"]), int(args["stop"]),
+                result = self.list_files()
+            elif name == "read_file":
+                result = self.read_file(str(args["name"]), int(args.get("start_line", 1)))
+            elif name == "search_files":
+                result = self.search_files(str(args["term"]))
+            elif name == "decode_text":
+                result = self.decode_text(str(args["text"]))
+            elif name == "run_python":
+                result = self.run_python(str(args["code"]))
+            elif name == "save_solution_script":
+                result = self.save_solution_script(str(args["name"]), str(args["code"]))
+            elif name == "http_get":
+                result = self.http_get(str(args["path"]), args.get("headers"))
+            elif name == "http_post":
+                result = self.http_post(str(args["path"]), str(args.get("body", "")),
+                                       str(args.get("content_type", "application/x-www-form-urlencoded")),
+                                       args.get("headers"))
+            elif name == "http_prefix_oracle":
+                result = self.http_prefix_oracle(str(args["path"]), str(args["field"]),
+                                                str(args["alphabet"]), int(args["length"]),
                                                 str(args["success_marker"]), args.get("fixed_fields"))
-            if name == "analyze_binary":
-                return self.analyze_binary(str(args["name"]))
-            if name == "inspect_archive":
-                return self.inspect_archive(str(args["name"]))
-            if name == "read_archive_entry":
-                return self.read_archive_entry(str(args["name"]), str(args["entry_path"]))
-            if name == "hash_calc":
-                return self.hash_calc(str(args.get("text", "")), str(args.get("file_name", "")))
-            if name == "inspect_elf":
+            elif name == "http_integer_oracle":
+                result = self.http_integer_oracle(str(args["path"]), str(args["field"]),
+                                                 int(args["start"]), int(args["stop"]),
+                                                 str(args["success_marker"]), args.get("fixed_fields"))
+            elif name == "analyze_binary":
+                result = self.analyze_binary(str(args["name"]))
+            elif name == "inspect_archive":
+                result = self.inspect_archive(str(args["name"]))
+            elif name == "read_archive_entry":
+                result = self.read_archive_entry(str(args["name"]), str(args["entry_path"]))
+            elif name == "hash_calc":
+                result = self.hash_calc(str(args.get("text", "")), str(args.get("file_name", "")))
+            elif name == "inspect_elf":
                 from ctf_binary_tools import inspect_elf
-                return inspect_elf(self._file(str(args["name"])), str(args.get("symbol_filter", "")))
-            if name == "disassemble_function":
+                result = inspect_elf(self._file(str(args["name"])), str(args.get("symbol_filter", "")))
+            elif name == "disassemble_function":
                 from ctf_binary_tools import disassemble_function
-                return disassemble_function(self._file(str(args["name"])), str(args["symbol"]),
-                                            int(args.get("max_instructions", 120)))
-            if name == "search_binary_strings":
+                result = disassemble_function(self._file(str(args["name"])), str(args["symbol"]),
+                                             int(args.get("max_instructions", 120)))
+            elif name == "search_binary_strings":
                 from ctf_binary_tools import search_binary_strings
                 file_name = str(args["name"])
-                result = search_binary_strings(self._file(file_name), str(args["term"]))
-                self._record_flags(result, f"바이너리 문자열: {file_name}")
-                return result
-            if name == "file_hexdump":
+                res = search_binary_strings(self._file(file_name), str(args["term"]))
+                self._record_flags(res, f"바이너리 문자열: {file_name}")
+                result = res
+            elif name == "file_hexdump":
                 from ctf_binary_tools import file_hexdump
-                return file_hexdump(self._file(str(args["name"])), int(args.get("offset", 0)),
-                                    int(args.get("length", 256)))
-            if name == "tcp_exchange":
-                return self.tcp_exchange(args["steps"])
+                result = file_hexdump(self._file(str(args["name"])), int(args.get("offset", 0)),
+                                     int(args.get("length", 256)))
+            elif name == "tcp_exchange":
+                result = self.tcp_exchange(args["steps"])
+            elif name == "calculate_stack_layout":
+                from ctf_binary_tools import calculate_stack_layout
+                result = calculate_stack_layout(self._file(str(args["name"])), str(args.get("symbol", "main")))
+            elif name == "find_rop_gadgets":
+                from ctf_binary_tools import find_rop_gadgets
+                result = find_rop_gadgets(self._file(str(args["name"])), int(args.get("max_gadgets", 25)))
+            elif name == "find_string_xrefs":
+                from ctf_binary_tools import find_string_xrefs
+                result = find_string_xrefs(self._file(str(args["name"])), str(args["term"]))
+            elif name == "extract_crypto_params":
+                from ctf_category_tools import extract_crypto_params
+                content = ""
+                if "file_name" in args and args["file_name"]:
+                    content = self._file(str(args["file_name"])).read_text(encoding="utf-8", errors="replace")
+                elif "text" in args:
+                    content = str(args["text"])
+                result = extract_crypto_params(content)
+            elif name == "carve_file_signatures":
+                from ctf_category_tools import carve_file_signatures
+                result = carve_file_signatures(self._file(str(args["name"])))
+            elif name == "inspect_pcap":
+                from ctf_category_tools import inspect_pcap
+                file_name = str(args["name"])
+                res = inspect_pcap(self._file(file_name))
+                self._record_flags(res, f"PCAP ??: {file_name}")
+                result = res
+            elif name == "diff_http_responses":
+                from ctf_category_tools import diff_http_responses
+                body1 = args.get("body1")
+                body2 = args.get("body2")
+                label1 = "?? 1"
+                label2 = "?? 2"
+                if not body1 and "path1" in args and self.web_origin:
+                    label1 = str(args["path1"])
+                    body1 = self.http_get(label1)
+                if not body2 and "path2" in args and self.web_origin:
+                    label2 = str(args["path2"])
+                    body2 = self.http_get(label2)
+                result = diff_http_responses(str(body1 or ""), str(body2 or ""), label1, label2)
         except (ValueError, KeyError, TypeError) as exc:
-            return f"도구 입력 오류: {exc}"
-        return "허용되지 않은 도구입니다."
+            result = f"도구 입력 오류: {exc}"
+
+        if hasattr(self, "tool_history"):
+            self.tool_history.append((name, args_key, str(result)))
+        return str(result)
 
     def save_solution_script(self, name: str, code: str) -> str:
         checked_name(name)
@@ -946,6 +1033,11 @@ class Case:
             return "이 실행의 TCP 교환은 최대 8회입니다."
         if not isinstance(steps, list) or len(steps) > 12 or any(not isinstance(step, str) for step in steps):
             return "TCP 입력은 최대 12개의 문자열 단계로 지정하세요."
+
+        # If the model passed a leading empty step intended to "wait for prompt", strip it so one-shot services aren't killed
+        while len(steps) > 1 and steps[0].strip() == "":
+            steps = steps[1:]
+
         payloads = []
         for step in steps:
             if len(step) > 2048:
@@ -994,6 +1086,15 @@ class Case:
         output = b"".join(chunks).decode("utf-8", errors="replace")
         self._log_exchange("TCP", f"{host}:{port}", {}, "\n".join(steps), output)
         self._record_flags(output, f"문제 서버: {host}:{port}")
+
+        # Diagnostic hint for LLM if server returned Python interpreter error
+        if re.search(r"\b(?:NameError|SyntaxError|TypeError|AttributeError|ValueError)\b|name '[^']+' is not defined|Traceback \(most recent call last\)", output, re.I):
+            diag = (
+                "\n[CTF 도우미 진단: 원격 TCP 서비스가 입력을 Python 코드로 실행하고 오류를 반환했습니다. "
+                "이 포트는 HTTP 웹 서버가 아닌 Python exec() / 대화형 환경입니다. "
+                "HTTP 요청(GET/POST)을 보내지 말고, 파일 읽기 코드(예: print(open('flag').read()) 또는 print(open('/home/py/flag').read()))를 단일 입력으로 전송하세요.]"
+            )
+            output += diag
         return output[:8192] or "문제 TCP 서버에서 출력이 없습니다."
 
     def http_get(self, path: str, headers: dict | None = None) -> str:
@@ -1287,6 +1388,15 @@ class Case:
                   "officially_verified": False, "run_directory": str(self.root)}
         if cost_usd is not None:
             output["cost_usd"] = round(cost_usd, 6)
+        if hasattr(self, "metrics"):
+            output["metrics"] = self.metrics.finish()
+        if hasattr(self, "state"):
+            output["hypotheses"] = [h.to_dict() for h in self.state.hypotheses]
+            output["attempts"] = self.state.attempts
+            try:
+                CheckpointStore().save_session(self.state, self.evidence)
+            except Exception:
+                pass
         (self.root / "result.json").write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
         self.event("완료")
         return output
@@ -1317,13 +1427,14 @@ class Case:
         except Exception as exc:
             summary = f"대화 요약 실패({exc}). 이전 분석 단계의 증거를 기반으로 분석을 계속합니다."
 
-        if summary:
-            for flag in extract_flags(summary, self.pattern):
-                record = {"flag": flag, "source": "압축 요약", "status": "압축 요약에서 도출됨 (정답 미확인)"}
-                if record not in self.evidence:
-                    self.evidence.append(record)
+        if hasattr(self, "metrics"):
+            self.metrics.record_compaction()
 
-            evidence_summary = "\n".join(f"- {item['flag']} ({item['source']})" for item in self.evidence)
+        if summary:
+            evidence_summary = "\n".join(
+                f"- {item['flag']} ({item['source']})" for item in self.evidence
+                if ObjectiveVerifier.is_actionable_candidate(item)
+            )
             new_user_content = (
                 f"문제 설명:\n{self.description}\n\n"
                 f"문제 서버 출력:\n{self.service_output or '제공되지 않음'}\n\n"
@@ -1339,7 +1450,8 @@ class Case:
             ]
         return [messages[0], messages[1]] + messages[-4:]
 
-    def solve(self, model: str = DEFAULT_MODEL, max_steps: int | None = None) -> dict:
+    def solve(self, model: str = DEFAULT_MODEL, max_steps: int | None = None,
+              think_mode: str | None = None) -> dict:
         if model in OPENAI_MODELS:
             step_limit = 15
             effective_steps = 8 if max_steps is None else max_steps
@@ -1381,7 +1493,13 @@ class Case:
             "If /flag exists only on the remote server and its output is unavailable, state that the exact flag is unknown. "
             "Use HTTP tools only for the explicitly supplied CTF web origin. For a source-proven finite prefix or integer oracle, "
             "call http_prefix_oracle or http_integer_oracle to complete the search and inspect the actual response; do not stop at a sample script. "
-            "If a CTF TCP endpoint was explicitly supplied, use tcp_exchange to inspect its menu and test a reasoned input sequence. "
+            "If a CTF TCP endpoint was explicitly supplied, use tcp_exchange to interact with it. "
+            "When using tcp_exchange: "
+            "1. tcp_exchange automatically receives the initial banner/prompt upon connecting. NEVER pass an empty string '' as step 0. "
+            "2. If the service is a Python script (e.g. exec(input()) or one-shot command runner), the service terminates after the first input! Send your complete command in step 0, e.g. steps: [\"print(open('flag').read())\"]. "
+            "3. In Python exec() / eval() challenges, you MUST use print(...) to write output back over the socket. Simply reading without print() produces no network response. "
+            "4. If tcp_exchange returns a Python error (e.g. name error, syntax error), the remote service is a Python interpreter, NOT an HTTP server. Never send HTTP requests (like GET / HTTP/1.1) to a Python socket. "
+            "5. Never repeat an identical failed tool call. If an error occurs, analyze the error and change your payload. "
             "If you derive a reusable solution, save its code with save_solution_script; prioritize obtaining the actual result first. "
             "Treat strings marked Fake_Flag, dummy, or decoy as known non-answers; do not stop on them. "
             "Strings observed in a file or banner can be fragments or decoys; verify their role before concluding. "
@@ -1401,25 +1519,41 @@ class Case:
                         and (self.tcp_endpoint or tool["function"]["name"] != "tcp_exchange")]
         no_call_retries = 0
 
+        eff_mode = think_mode or os.environ.get("CTF_HELPER_THINK_MODE", "quick").strip() or "quick"
+        if eff_mode == "deep":
+            think_flag = True
+            model_options = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "num_ctx": 16384, "num_predict": 4096}
+        else:
+            think_flag = False
+            model_options = {"temperature": 0, "num_ctx": 16384, "num_predict": 4096}
+
+        needs_compaction = False
         for turn in range(effective_steps):
             current_chars = sum(len(str(m.get("content") or "")) for m in messages)
-            if current_chars >= 26000:
+            if current_chars >= 26000 or needs_compaction:
                 self.event("정보량 한도 근접: 중요 단서만 추출하고 컨텍스트 초기화(압축) 중")
                 messages = self._compact_messages(model, system_content, messages)
                 transcript.append({"compaction": True, "turn": turn + 1})
+                needs_compaction = False
 
+            if hasattr(self, "state"):
+                self.state.budgets["current_step"] = turn + 1
             self.event(f"모델 분석 {turn+1}/{effective_steps}")
+
+            start_t = time.monotonic()
             response = ollama_request("/api/chat", {
                 "model": model, "messages": messages,
-                "tools": active_tools, "stream": False, "think": False,
-                "options": {"temperature": 0, "num_ctx": 16384, "num_predict": 4096}
+                "tools": active_tools, "stream": False, "think": think_flag,
+                "options": model_options
             }, timeout=180)
+            latency = time.monotonic() - start_t
 
             prompt_tokens = response.get("prompt_eval_count") or 0
+            eval_tokens = response.get("eval_count") or 0
+            if hasattr(self, "metrics"):
+                self.metrics.record_turn(prompt_tokens, eval_tokens, latency)
             if prompt_tokens >= 11500 and current_chars < 26000:
-                self.event("토큰 한도 근접: 중요 단서만 추출하고 컨텍스트 초기화(압축) 중")
-                messages = self._compact_messages(model, system_content, messages)
-                transcript.append({"compaction": True, "turn": turn + 1})
+                needs_compaction = True
 
             msg = response.get("message", {})
             content = msg.get("content", "") or ""
@@ -1440,7 +1574,14 @@ class Case:
                                "tools": [c.get("function", {}).get("name") for c in calls]})
             if not calls:
                 tcp_untested = bool(self.tcp_endpoint and self.tcp_requests == 0)
-                if (self.has_derived_candidate() and not tcp_untested) or turn >= effective_steps - 1 or no_call_retries >= 2:
+                has_real_candidate = any(
+                    ObjectiveVerifier.is_actionable_candidate(item) and
+                    (item.get("source") in {"디코딩 결과", "격리 Python 실행 출력"} or
+                     str(item.get("source", "")).startswith(("아카이브 내부", "해시 계산:")))
+                    for item in self.evidence
+                )
+                max_retries = 2 if has_real_candidate else 4
+                if (has_real_candidate and not tcp_untested) or turn >= effective_steps - 1 or no_call_retries >= max_retries:
                     answer = content or "모델이 답변을 생성하지 못했습니다."
                     break
 
@@ -1450,8 +1591,9 @@ class Case:
                     "role": "user",
                     "content": (
                         "발견된 문자열이 실제 정답인지, 조각 또는 미끼인지 아직 확인되지 않았습니다. "
-                        + ("사용자가 지정한 CTF TCP 서버에서 tcp_exchange로 메뉴와 입력 결과를 확인하세요. "
-                           if tcp_untested else "")
+                        + ("사용자가 지정한 CTF TCP 서버에서 tcp_exchange로 원격 플래그를 읽어내세요. "
+                           "(원격 서비스가 Python exec(input()) 형태라면 steps: [\"print(open('flag').read())\"] 처럼 단일 페이로드로 전송해야 합니다.) "
+                           if tcp_untested or not any(item.get('source', '').startswith('문제 서버:') for item in self.evidence) else "")
                         + "유한한 웹 탐색이 필요하면 http_prefix_oracle/http_integer_oracle로 끝까지 확인하세요. "
                         + "inspect_elf, disassemble_function, search_binary_strings 등 사용 가능한 도구로 "
                         "아직 확인하지 않은 근거를 살펴보고 실제 Flag를 계속 추적하세요."
