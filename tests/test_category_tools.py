@@ -10,6 +10,32 @@ from ctf_binary_tools import calculate_stack_layout, find_rop_gadgets, find_stri
 
 
 class TestCategoryTools(unittest.TestCase):
+    def test_extract_crypto_params_byte_caesar(self):
+        # Synthetic Byte-Caesar with key=178
+        flag = b"DH{caesar_byte_shift_success}"
+        enc = bytes((b + 178) % 256 for b in flag)
+        res = extract_crypto_params(f"encrypted data: {enc.hex()}")
+        self.assertIn("Byte-Caesar", res)
+        self.assertIn("DH{caesar_byte_shift_success}", res)
+        self.assertIn("178", res)
+
+    def test_extract_crypto_params_xor(self):
+        # Synthetic single-byte XOR
+        flag = b"DH{single_byte_xor_success}"
+        enc = bytes(b ^ 0x5a for b in flag)
+        res = extract_crypto_params(f"xor data: {enc.hex()}")
+        self.assertIn("Single-byte XOR", res)
+        self.assertIn("DH{single_byte_xor_success}", res)
+        self.assertIn("0x5a", res)
+
+    def test_decode_text_byte_shift(self):
+        flag = b"DH{decode_text_byte_shift_test}"
+        enc = bytes((b + 42) % 256 for b in flag)
+        case = helper.Case("Byte-shift test", [("dummy.txt", b"test")])
+        res = case.decode_text(enc.hex())
+        self.assertIn("byte_shift_0x2a", res)
+        self.assertIn("DH{decode_text_byte_shift_test}", res)
+
     def test_extract_crypto_params_e3(self):
         text = '''
         n = 0x93821039481239081239

@@ -589,9 +589,24 @@ class Case:
             out.append(f"base85: {raw_b85[:2048].decode('utf-8', errors='replace')}")
         except (ValueError, UnicodeError):
             pass
-        # 4. Hex (support raw hex, spaces, 0x, \\x)
-        hex_clean = re.sub(r"[^0-9a-fA-F]", "", cleaned.replace("0x", "").replace("\\x", ""))
-        if len(hex_clean) >= 2 and len(hex_clean) % 2 == 0:
+        # 4. Hex (support raw hex, spaces, 0x, \\x, and embedded hex tokens)
+        hex_tokens = []
+        if re.fullmatch(r"(?:0x|\\\\x)?[0-9a-fA-F\s]+", cleaned):
+            cand = re.sub(r"[^0-9a-fA-F]", "", cleaned.replace("0x", "").replace("\\\\x", ""))
+            if len(cand) >= 2 and len(cand) % 2 == 0:
+                hex_tokens.append(cand)
+        else:
+            for m in re.finditer(r"\b[0-9a-fA-F]{8,}\b", cleaned):
+                tok = m.group(0)
+                if len(tok) % 2 == 0:
+                    hex_tokens.append(tok)
+            if not hex_tokens:
+                cand = re.sub(r"[^0-9a-fA-F]", "", cleaned.replace("0x", "").replace("\\\\x", ""))
+                if len(cand) >= 4 and len(cand) % 2 == 0:
+                    hex_tokens.append(cand)
+
+        hex_clean = hex_tokens[0] if hex_tokens else ""
+        if hex_clean:
             try:
                 raw_hex = bytes.fromhex(hex_clean)
                 out.append(f"hex: {raw_hex[:2048].decode('utf-8', errors='replace')}")
@@ -641,16 +656,16 @@ class Case:
         if self.pattern.search(rev):
             out.append(f"reversed: {rev}")
         # 11. Single-byte XOR brute-force against flag pattern
-        xor_targets = []
-        if len(hex_clean) >= 4 and len(hex_clean) % 2 == 0:
+        byte_targets = []
+        for htok in (hex_tokens or ([hex_clean] if hex_clean else [])):
             try:
-                xor_targets.append(bytes.fromhex(hex_clean))
+                byte_targets.append(bytes.fromhex(htok))
             except Exception:
                 pass
         if cleaned.isascii() and len(cleaned) >= 4:
-            xor_targets.append(cleaned.encode("ascii", errors="ignore"))
+            byte_targets.append(cleaned.encode("ascii", errors="ignore"))
 
-        for target in xor_targets:
+        for target in byte_targets:
             found_xor = False
             for k in range(1, 256):
                 xored = bytes(b ^ k for b in target)
@@ -668,6 +683,24 @@ class Case:
             if found_xor:
                 break
 
+        # 12. Single-byte Caesar / Byte-shift brute-force: c = (p + k) % 256
+        for target in byte_targets:
+            found_shift = False
+            for k in range(1, 256):
+                shifted = bytes((b - k) % 256 for b in target)
+                try:
+                    dec = shifted.decode("utf-8")
+                except UnicodeError:
+                    try:
+                        dec = shifted.decode("latin-1")
+                    except UnicodeError:
+                        continue
+                if self.pattern.search(dec):
+                    out.append(f"byte_shift_0x{k:02x} (key={k}): {dec[:2048]}")
+                    found_shift = True
+                    break
+            if found_shift:
+                break
         result = "\n".join(out)[:6000]
         self._record_flags(result, "디코딩 결과")
         return result
@@ -981,7 +1014,9 @@ class Case:
                     content = self._file(str(args["file_name"])).read_text(encoding="utf-8", errors="replace")
                 elif "text" in args:
                     content = str(args["text"])
-                result = extract_crypto_params(content)
+                res = extract_crypto_params(content)
+                self._record_flags(res, "?? ???? / ??? ??")
+                result = res
             elif name == "carve_file_signatures":
                 from ctf_category_tools import carve_file_signatures
                 result = carve_file_signatures(self._file(str(args["name"])))
@@ -1522,7 +1557,7 @@ class Case:
         eff_mode = think_mode or os.environ.get("CTF_HELPER_THINK_MODE", "quick").strip() or "quick"
         if eff_mode == "deep":
             think_flag = True
-            model_options = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "num_ctx": 16384, "num_predict": 4096}
+            model_options = {"temperature": 0, "num_ctx": 16384, "num_predict": 4096}
         else:
             think_flag = False
             model_options = {"temperature": 0, "num_ctx": 16384, "num_predict": 4096}
@@ -1557,7 +1592,20 @@ class Case:
 
             msg = response.get("message", {})
             content = msg.get("content", "") or ""
+            thinking = msg.get("thinking", "") or ""
             calls = msg.get("tool_calls") or []
+
+            if thinking:
+                for flag in extract_flags(thinking, self.pattern):
+                    role = next((item.get("role", "candidate") for item in self.evidence
+                                 if item.get("flag") == flag and item.get("role") in {"fragment", "decoy"}), "candidate")
+                    record = {"flag": flag, "source": "?? ??(Thinking)", "status": "?? ?? ?? (?? ???)",
+                              "role": role}
+                    if record not in self.evidence:
+                        self.evidence.append(record)
+
+            if not content and thinking:
+                content = f"[?? ?? ??]\n{thinking[-1500:]}"
 
             if content:
                 for flag in extract_flags(content, self.pattern):

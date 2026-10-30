@@ -15,10 +15,71 @@ import struct
 def extract_crypto_params(content: str) -> str:
     """
     Extracts common crypto parameters (RSA n, e, c, p, q, d, etc.) from text,
-    diagnoses the vulnerability, and outputs a ready-to-execute Python template.
+    detects Byte-Caesar/1-byte shift and XOR ciphers on hex ciphertext,
+    diagnoses vulnerabilities, and outputs ready-to-execute Python templates.
     """
+    FLAG_PATTERN = re.compile(r"(?:ACDC|FLAG|CTF|DH|APS)\{[^}\r\n]{3,120}\}", re.IGNORECASE)
+
+    # 1. Byte-Caesar / 1-byte shift and XOR cipher detection on hex strings
+    hex_candidates = re.findall(r"[0-9a-fA-F]{16,}", content)
+    for hc in hex_candidates:
+        if len(hc) % 2 != 0:
+            hc = hc[:-1]
+        try:
+            data = bytes.fromhex(hc)
+        except Exception:
+            continue
+
+        # Test Byte-Caesar shift: c = (p + k) % 256 => p = (c - k) % 256
+        for k in range(1, 256):
+            dec = bytes((b - k) % 256 for b in data)
+            try:
+                dec_str = dec.decode("latin-1")
+            except Exception:
+                continue
+            m = FLAG_PATTERN.search(dec_str)
+            if m:
+                flag = m.group(0)
+                return (
+                    f"[Byte-Caesar / 1-바이트 시프트 암호 자동 해독 성공!]\n"
+                    f"- 발견된 암호화 키: key = {k} (0x{k:02x})\n"
+                    f"- 복호화된 Flag: {flag}\n"
+                    f"- 복호화된 평문 미리보기:\n"
+                    f"  {dec_str[:220]}...\n\n"
+                    f"[즉시 실행 가능한 공격 스크립트 (run_python용)]:\n"
+                    f"```python\n"
+                    f'enc = bytes.fromhex("{hc[:64]}") # 전체 암호문 길이: {len(data)}바이트\n'
+                    f"key = {k}\n"
+                    f"print(bytes((b - key) % 256 for b in enc).decode('latin1', errors='replace'))\n"
+                    f"```"
+                )
+
+        # Test Single-byte XOR: c = p ^ k => p = c ^ k
+        for k in range(1, 256):
+            dec = bytes(b ^ k for b in data)
+            try:
+                dec_str = dec.decode("latin-1")
+            except Exception:
+                continue
+            m = FLAG_PATTERN.search(dec_str)
+            if m:
+                flag = m.group(0)
+                return (
+                    f"[Single-byte XOR 암호 자동 해독 성공!]\n"
+                    f"- 발견된 XOR 키: key = 0x{k:02x} ({k})\n"
+                    f"- 복호화된 Flag: {flag}\n"
+                    f"- 복호화된 평문 미리보기:\n"
+                    f"  {dec_str[:220]}...\n\n"
+                    f"[즉시 실행 가능한 공격 스크립트 (run_python용)]:\n"
+                    f"```python\n"
+                    f'enc = bytes.fromhex("{hc[:64]}") # 전체 암호문 길이: {len(data)}바이트\n'
+                    f"key = {k}\n"
+                    f"print(bytes(b ^ key for b in enc).decode('latin1', errors='replace'))\n"
+                    f"```"
+                )
+
+    # 2. RSA / Discrete Log parameters extraction
     params = {}
-    # Patterns for variable assignments (decimal, hex, base64)
     patterns = [
         (r"\b(?:n|N|modulus)\s*[:=]\s*(0x[0-9a-fA-F]+|\d+)", "n"),
         (r"\b(?:e|E|exponent)\s*[:=]\s*(0x[0-9a-fA-F]+|\d+)", "e"),
@@ -37,7 +98,7 @@ def extract_crypto_params(content: str) -> str:
             params[name] = val
 
     if not params:
-        return "암호화 파라미터(n, e, c, p, q 등)를 감지하지 못했습니다."
+        return "암호화 파라미터(n, e, c, p, q 등) 및 시프트/XOR 암호문을 감지하지 못했습니다."
 
     lines = ["[추출된 암호 파라미터]:"]
     for k, v in params.items():
@@ -67,7 +128,7 @@ m = pow(c, d, p * q)
 print('Decrypted bytes:', bytes.fromhex(hex(m)[2:]).decode('latin1', errors='replace'))
 """
     elif e_val == 3 and n_val and c_val:
-        lines.append("- e = 3 (초저지수): m^3 < n 인 경우 세제곱근(cube root) 즉시 복호화 가능")
+        lines.append("- e = 3 (초저지수): m^3 < n 일 경우 세제곱근(cube root) 즉시 복호화 가능")
         attack_script = f"""# Low exponent e=3 cube root attack
 import decimal
 decimal.getcontext().prec = 1000
@@ -88,7 +149,7 @@ else:
             break
 """
     elif e_val and e_val > 65537 and n_val and c_val:
-        lines.append("- e 가 매우 큼: 작은 비밀키 d를 사용하는 Wiener's Attack 대상일 가능성 높음")
+        lines.append("- e 값이 매우 큼: 작은 비밀키 d를 사용하는 Wiener's Attack 대상일 가능성 높음")
         attack_script = f"""# Wiener's attack (small d)
 import owiener
 n = {n_val}
@@ -134,7 +195,7 @@ print('Decrypted:', bytes.fromhex(hex(m)[2:]).decode('latin1', errors='replace')
 
 SIGNATURES = [
     (b"PK\x03\x04", "ZIP Archive", b"PK\x05\x06", 22),
-    (b"\x89PNG\r\n\x1a\n", "PNG Image", b"IEND\xaeB`\x82", 8),
+    (b"\x89PNG\r\n\x1a\n", "PNG Image", b"IEND\xaeB\x60\x82", 8),
     (b"\xff\xd8\xff", "JPEG Image", b"\xff\xd9", 2),
     (b"\x7fELF", "ELF Binary", None, 0),
     (b"7z\xbc\xaf\x27\x1c", "7-Zip Archive", None, 0),
@@ -171,7 +232,7 @@ def carve_file_signatures(path: Path) -> str:
                     if idx == 0 and end_offset < file_size:
                         overlay_size = file_size - end_offset
                         findings.append(
-                            f"[★ 오버레이 데이터 감지] 0x{end_offset:x} 부터 파일 끝까지 {overlay_size} bytes의 숨김/추가 데이터 존재 (Steganography 의심!)"
+                            f"[오버레이 데이터 감지] 0x{end_offset:x} 부터 파일 끝까지 {overlay_size} bytes의 은닉/추가 데이터 존재 (Steganography 의심!)"
                         )
             findings.append(f"0x{idx:x}: {name} {end_info}")
             start_pos = idx + len(magic)
@@ -222,7 +283,7 @@ def inspect_pcap(path: Path) -> str:
     lines = [f"[PCAP 패킷 캡처 분석: {path.name} ({len(data)} bytes)]"]
     if flag_matches:
         unique_flags = list(dict.fromkeys(flag_matches))
-        lines.append(f"★ 패킷 페이로드에서 직접 발견된 플래그:\n  " + "\n  ".join(unique_flags))
+        lines.append(f"- 패킷 페이로드에서 직접 발견된 플래그:\n  " + "\n  ".join(unique_flags))
 
     if http_requests:
         lines.append(f"\n[추출된 HTTP 요청 (총 {len(http_requests)}건)]:")
