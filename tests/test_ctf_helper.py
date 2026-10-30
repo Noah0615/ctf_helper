@@ -4,6 +4,7 @@ import base64
 import io
 import json
 from pathlib import Path
+from urllib.parse import parse_qs
 import sys
 import tempfile
 import time
@@ -222,6 +223,70 @@ class HelperTests(unittest.TestCase):
         self.assertIn("상대 경로", case.http_get("https://elsewhere.example/"))
         with self.assertRaises(ValueError):
             helper.Case("웹 문제", [], tcp_endpoint="http://ctf.example:8000/path")
+
+    def test_bounded_web_oracles_complete_prefix_and_integer_search(self):
+        case = helper.Case("Find the locker", [], flag_regex="DH{...}",
+                           tcp_endpoint="http://ctf.example:8000/")
+        case.http_direct_requests = helper.MAX_DIRECT_HTTP_REQUESTS
+
+        class Reply:
+            status = 200
+            headers = {"Content-Type": "text/html"}
+            def __init__(self, body):
+                self.body = body.encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+            def read(self, *_):
+                return self.body
+
+        def fake_open(request, timeout):
+            self.assertEqual(request.full_url, "http://ctf.example:8000/")
+            form = parse_qs(request.data.decode())
+            candidate = form["locker_num"][0]
+            password = form["password"][0]
+            if candidate == "b2" and password == "102":
+                return Reply("<pre>FLAG:DH{oracle_test}</pre>")
+            return Reply("<pre>Good</pre>" if "b2".startswith(candidate) else "<pre>Wrong!</pre>")
+
+        with patch.object(helper, "build_opener") as opener:
+            opener.return_value.open.side_effect = fake_open
+            prefix = json.loads(case.call_tool("http_prefix_oracle", {
+                "path": "/", "field": "locker_num", "alphabet": "ab12", "length": 2,
+                "success_marker": "<pre>Good</pre>", "fixed_fields": {"password": "0"}}))
+            self.assertEqual(prefix["prefix"], "b2")
+            found = json.loads(case.call_tool("http_integer_oracle", {
+                "path": "/", "field": "password", "start": 100, "stop": 103,
+                "success_marker": "FLAG:", "fixed_fields": {"locker_num": prefix["prefix"]}}))
+        self.assertEqual(found["flags"], ["DH{oracle_test}"])
+        self.assertEqual(case.http_direct_requests, helper.MAX_DIRECT_HTTP_REQUESTS)
+        self.assertGreater(case.http_batch_requests, 8)
+        self.assertEqual(len(case.requests), case.http_batch_requests)
+        self.assertIn("최대 8회", case.http_post("/", "x=1"))
+        self.assertIn("300", case.call_tool("http_integer_oracle", {
+            "path": "/", "field": "password", "start": 0, "stop": 300,
+            "success_marker": "FLAG:"}))
+
+    def test_batch_web_tools_are_hidden_without_a_supplied_web_origin(self):
+        names = {tool["name"] for tool in openai_helper._openai_tools(False, False)}
+        self.assertNotIn("http_prefix_oracle", names)
+        self.assertNotIn("http_integer_oracle", names)
+        visible = {tool["name"] for tool in openai_helper._openai_tools(True, False)}
+        self.assertIn("http_prefix_oracle", visible)
+        self.assertIn("http_integer_oracle", visible)
+
+    def test_solution_script_is_saved_without_execution_and_restored_on_continue(self):
+        case = helper.Case("Save the solver", [])
+        output = case.call_tool("save_solution_script", {"name": "solve.py", "code": "print('reproducible')\n"})
+        self.assertIn("저장됨", output)
+        self.assertEqual((case.root / "solutions" / "solve.py").read_text(encoding="utf-8"),
+                         "print('reproducible')\n")
+        self.assertIn("입력 오류", case.call_tool("save_solution_script", {"name": "../escape.py", "code": "x"}))
+        result = case.finish(helper.DEFAULT_MODEL, "풀이 코드 저장", [])
+        self.assertEqual(result["solution_scripts"][0]["name"], "solve.py")
+        resumed = helper.Case.from_run(case.id, "새 단서")
+        self.assertEqual(resumed.solution_scripts[0]["code"], "print('reproducible')\n")
 
     def test_http_get_keeps_remote_zip_bytes_and_records_archive_flag(self):
         blob = io.BytesIO()

@@ -146,6 +146,8 @@ $('reset-btn').addEventListener('click', () => {
   $('status').textContent = '';
   $('flags').replaceChildren();
   $('answer').textContent = '';
+  $('solutions').textContent = '';
+  $('solutions-details').hidden = true;
   $('events').textContent = '';
   $('request-log').textContent = '';
   $('continue-panel').hidden = true;
@@ -163,6 +165,10 @@ $('copy-report-btn').addEventListener('click', () => {
   btn.textContent = '복사 완료!';
   btn.classList.add('copied');
   setTimeout(() => { btn.textContent = '전체 결과 복사'; btn.classList.remove('copied'); }, 1500);
+});
+
+$('copy-solutions-btn').addEventListener('click', () => {
+  navigator.clipboard.writeText($('solutions').textContent);
 });
 
 async function loadHistory() {
@@ -194,6 +200,8 @@ $('history-select').addEventListener('change', () => {
   $('status').textContent = '저장된 분석 기록 불러오는 중…';
   $('flags').replaceChildren();
   $('answer').textContent = '';
+  $('solutions').textContent = '';
+  $('solutions-details').hidden = true;
   poll(id);
 });
 
@@ -246,7 +254,7 @@ async function poll(id) {
   $('events').textContent = (r.events || []).join('\n');
   if (r.status === 'done') {
     $('flags').replaceChildren();
-    function addGroup(title, group) {
+    function addGroup(title, group, kind = 'candidate') {
       if (!group.length) return;
       const heading = document.createElement('h3');
       heading.textContent = title;
@@ -259,7 +267,7 @@ async function poll(id) {
       block.className = 'flag-item';
 
       const flagSpan = document.createElement('span');
-      flagSpan.className = 'flag-text';
+      flagSpan.className = kind === 'candidate' ? 'flag-text' : 'flag-observation-text';
       flagSpan.textContent = item.flag;
 
       const copyBtn = document.createElement('button');
@@ -283,8 +291,8 @@ async function poll(id) {
     }
     addGroup('문제 서버 응답에서 확인한 값', remote);
     addGroup('추가 후보 · 공식 채점 미확인', others);
-    addGroup('조각 · 변환 또는 결합 필요', observations.filter(item => item.role === 'fragment'));
-    addGroup('미끼로 표시된 문자열', observations.filter(item => item.role === 'decoy'));
+    addGroup('조각 · 변환 또는 결합 필요', observations.filter(item => item.role === 'fragment'), 'observation');
+    addGroup('미끼로 표시된 문자열', observations.filter(item => item.role === 'decoy'), 'observation');
     if (!observations.length && !items.length) $('flags').textContent = '관찰된 flag 형식 문자열이 없습니다. 문제 주소와 첨부 파일을 확인하세요.';
 
     if (r.result.cost_usd !== undefined) {
@@ -296,6 +304,9 @@ async function poll(id) {
     }
 
     $('answer').textContent = r.result.answer + `\n\n실행 ID: ${r.result.run_id}`;
+    const scripts = r.result.solution_scripts || [];
+    $('solutions').textContent = scripts.map(item => `### ${item.name}\n${item.code}`).join('\n\n');
+    $('solutions-details').hidden = scripts.length === 0;
     if (r.result.parent_id) $('answer').textContent += `\n이전 실행 ID: ${r.result.parent_id}`;
     $('request-log').textContent = (r.result.requests || []).map(entry =>
       `${entry.at} ${entry.method} ${entry.path}\n${entry.request_body_preview || ''}\n${entry.response}`).join('\n\n') || '이 실행에서 기록된 요청이 없습니다.';
@@ -324,6 +335,8 @@ $('form').addEventListener('submit', async event => {
   $('events').textContent = '';
   $('flags').replaceChildren();
   $('answer').textContent = '';
+  $('solutions').textContent = '';
+  $('solutions-details').hidden = true;
   try {
     const picked = selectedFiles;
     if (picked.length > MAX_FILES || picked.some(({file}) => file.size > MAX_FILE_BYTES) ||

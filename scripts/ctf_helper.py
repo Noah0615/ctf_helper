@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import time
 import struct
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ import http.cookiejar
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler, HTTPCookieProcessor
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 import uuid
 import zipfile
 
@@ -36,6 +37,9 @@ MAX_FILES = 256
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 96 * 1024 * 1024
 MAX_DESCRIPTION = 16000
+MAX_DIRECT_HTTP_REQUESTS = 8
+MAX_BATCH_HTTP_REQUESTS = 300
+MAX_BATCH_SECONDS = 300
 DECLARED_FLAG_FORMAT = re.compile(
     r"(?:flag\s*format|플래그(?:의)?\s*형식)\s*(?:[:：은는]\s*)?[`* ]*([A-Za-z][A-Za-z0-9_]{1,23})\s*\{",
     re.IGNORECASE,
@@ -224,11 +228,23 @@ TOOLS = [
                 {"text": {"type": "string"}}, ["text"]),
     tool_schema("run_python", "Run a short Python 3 calculation in an offline Docker sandbox; challenge files are read-only under /challenge",
                 {"code": {"type": "string"}}, ["code"]),
+    tool_schema("save_solution_script", "Save a reproducible exploit or analysis script in this run's local results without executing it. Obtain and verify a flag with the available tools when possible.",
+                {"name": {"type": "string"}, "code": {"type": "string"}}, ["name", "code"]),
     tool_schema("http_get", "GET one path on the explicitly supplied CTF web origin; returns status, response headers, and body",
                 {"path": {"type": "string"}, "headers": {"type": "object", "additionalProperties": {"type": "string"}}}, ["path"]),
     tool_schema("http_post", "POST data to one path on the explicitly supplied CTF web origin; returns status, response headers, and body",
                 {"path": {"type": "string"}, "body": {"type": "string"}, "content_type": {"type": "string"},
                  "headers": {"type": "object", "additionalProperties": {"type": "string"}}}, ["path"]),
+    tool_schema("http_prefix_oracle", "Recover a short unknown string one character at a time from a positive POST response marker on the supplied CTF web origin; up to 300 total batch requests. Use when source shows a prefix oracle instead of stopping with pseudocode.",
+                {"path": {"type": "string"}, "field": {"type": "string"}, "alphabet": {"type": "string"},
+                 "length": {"type": "integer"}, "success_marker": {"type": "string"},
+                 "fixed_fields": {"type": "object", "additionalProperties": {"type": "string"}}},
+                ["path", "field", "alphabet", "length", "success_marker"]),
+    tool_schema("http_integer_oracle", "Try a bounded integer interval in one POST form field on the supplied CTF web origin; stop at a success marker or flag. Shares the 300-request batch budget with http_prefix_oracle.",
+                {"path": {"type": "string"}, "field": {"type": "string"}, "start": {"type": "integer"},
+                 "stop": {"type": "integer"}, "success_marker": {"type": "string"},
+                 "fixed_fields": {"type": "object", "additionalProperties": {"type": "string"}}},
+                ["path", "field", "start", "stop", "success_marker"]),
     tool_schema("analyze_binary", "Inspect a supplied binary without executing it: magic, architecture, entropy, and printable strings (ASCII/UTF-16)",
                 {"name": {"type": "string"}}, ["name"]),
     tool_schema("inspect_archive", "List safe metadata and previews from a supplied ZIP or TAR archive without extracting it to disk",
@@ -285,6 +301,8 @@ class Case:
         self.tcp_endpoint, self.web_origin = parse_challenge_endpoint(tcp_endpoint)
         self.service_output = ""
         self.http_requests = 0
+        self.http_direct_requests = 0
+        self.http_batch_requests = 0
         self.tcp_requests = 0
         self.cookie_jar = http.cookiejar.CookieJar()
         self.remote_archives: dict[str, str] = {}
@@ -311,6 +329,7 @@ class Case:
         self.event = event or (lambda message: None)
         self.evidence: list[dict] = []
         self.requests: list[dict] = []
+        self.solution_scripts: list[dict] = []
         for name, (_, data) in zip(names, files):
             target = self.files_dir.joinpath(*name.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -378,6 +397,12 @@ class Case:
             shutil.copyfile(item, destination)
             copied_extra.append(relative)
             extra_bytes += size
+        for script in result.get("solution_scripts", [])[:5]:
+            if isinstance(script, dict) and isinstance(script.get("name"), str) and isinstance(script.get("code"), str):
+                try:
+                    case.save_solution_script(script["name"], script["code"])
+                except ValueError:
+                    pass
         previous_evidence = result.get("flag_observations", result.get("flag_candidates", []))
         case.evidence = [item for item in previous_evidence if isinstance(item, dict)]
         case._record_flags(note, "추가 관찰")
@@ -852,12 +877,22 @@ class Case:
                 return self.decode_text(str(args["text"]))
             if name == "run_python":
                 return self.run_python(str(args["code"]))
+            if name == "save_solution_script":
+                return self.save_solution_script(str(args["name"]), str(args["code"]))
             if name == "http_get":
                 return self.http_get(str(args["path"]), args.get("headers"))
             if name == "http_post":
                 return self.http_post(str(args["path"]), str(args.get("body", "")),
                                       str(args.get("content_type", "application/x-www-form-urlencoded")),
                                       args.get("headers"))
+            if name == "http_prefix_oracle":
+                return self.http_prefix_oracle(str(args["path"]), str(args["field"]),
+                                               str(args["alphabet"]), int(args["length"]),
+                                               str(args["success_marker"]), args.get("fixed_fields"))
+            if name == "http_integer_oracle":
+                return self.http_integer_oracle(str(args["path"]), str(args["field"]),
+                                                int(args["start"]), int(args["stop"]),
+                                                str(args["success_marker"]), args.get("fixed_fields"))
             if name == "analyze_binary":
                 return self.analyze_binary(str(args["name"]))
             if name == "inspect_archive":
@@ -888,6 +923,21 @@ class Case:
         except (ValueError, KeyError, TypeError) as exc:
             return f"도구 입력 오류: {exc}"
         return "허용되지 않은 도구입니다."
+
+    def save_solution_script(self, name: str, code: str) -> str:
+        checked_name(name)
+        if not name.lower().endswith((".py", ".js", ".sh", ".txt")):
+            raise ValueError("풀이 코드는 .py, .js, .sh, .txt 파일로 저장하세요.")
+        if not code.strip() or len(code.encode("utf-8")) > 40_000:
+            raise ValueError("풀이 코드는 1~40,000바이트여야 합니다.")
+        if len(self.solution_scripts) >= 5 and not any(item["name"] == name for item in self.solution_scripts):
+            raise ValueError("한 실행에서 풀이 코드 파일은 최대 5개입니다.")
+        directory = self.root / "solutions"
+        directory.mkdir(exist_ok=True)
+        (directory / name).write_text(code, encoding="utf-8")
+        self.solution_scripts = [item for item in self.solution_scripts if item["name"] != name]
+        self.solution_scripts.append({"name": name, "code": code})
+        return f"풀이 코드 저장됨: {name} ({len(code.encode('utf-8'))}바이트). 이 코드는 실행하지 않았습니다."
 
     def tcp_exchange(self, steps: list[str]) -> str:
         if self.tcp_endpoint is None:
@@ -949,13 +999,14 @@ class Case:
     def http_get(self, path: str, headers: dict | None = None) -> str:
         if not self.web_origin:
             return "문제 웹 주소가 입력되지 않았습니다."
-        if self.http_requests >= 8:
-            return "이 실행의 문제 웹 요청은 최대 8회입니다."
+        if self.http_direct_requests >= MAX_DIRECT_HTTP_REQUESTS:
+            return "일반 웹 요청은 최대 8회입니다. 유한한 탐색에는 http_prefix_oracle 또는 http_integer_oracle을 사용하세요."
         parsed = urlsplit(path)
         if not path.startswith("/") or parsed.scheme or parsed.netloc or "#" in path:
             return "경로는 / 로 시작하는 동일 서버의 상대 경로만 허용됩니다."
         url = self.web_origin + path
         self.http_requests += 1
+        self.http_direct_requests += 1
         self.event("문제 웹 요청: " + path[:180])
         class NoRedirect(HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -1002,17 +1053,25 @@ class Case:
                            f"문제 웹 응답: {path[:180]}")
         return full_resp[:6500]
 
-    def http_post(self, path: str, body: str = "", content_type: str = "application/x-www-form-urlencoded", headers: dict | None = None) -> str:
+    def http_post(self, path: str, body: str = "", content_type: str = "application/x-www-form-urlencoded", headers: dict | None = None, *, _batch: bool = False) -> str:
         if not self.web_origin:
             return "문제 웹 주소가 입력되지 않았습니다."
-        if self.http_requests >= 8:
-            return "이 실행의 문제 웹 요청은 최대 8회입니다."
+        if _batch:
+            if self.http_batch_requests >= MAX_BATCH_HTTP_REQUESTS:
+                return "자동 반복 웹 요청 한도 300회에 도달했습니다."
+        elif self.http_direct_requests >= MAX_DIRECT_HTTP_REQUESTS:
+            return "일반 웹 요청은 최대 8회입니다. 유한한 탐색에는 http_prefix_oracle 또는 http_integer_oracle을 사용하세요."
         parsed = urlsplit(path)
         if not path.startswith("/") or parsed.scheme or parsed.netloc or "#" in path:
             return "경로는 / 로 시작하는 동일 서버의 상대 경로만 허용됩니다."
         url = self.web_origin + path
         self.http_requests += 1
-        self.event("문제 웹 POST 요청: " + path[:180])
+        if _batch:
+            self.http_batch_requests += 1
+        else:
+            self.http_direct_requests += 1
+        if not _batch:
+            self.event("문제 웹 POST 요청: " + path[:180])
         class NoRedirect(HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
@@ -1058,7 +1117,95 @@ class Case:
             return failure
         self._log_exchange("POST", path, req_headers, body, full_resp)
         self._record_flags(full_resp, f"문제 웹 응답: {path[:180]}")
-        return full_resp[:6500]
+        return full_resp if _batch else full_resp[:6500]
+
+    def _oracle_form(self, path: str, field: str, marker: str, fixed_fields: dict | None) -> dict[str, str]:
+        if not self.web_origin:
+            raise ValueError("사용자가 지정한 문제 웹 주소가 없습니다.")
+        parsed = urlsplit(path)
+        if not path.startswith("/") or parsed.scheme or parsed.netloc or "#" in path:
+            raise ValueError("같은 문제 웹 서버의 /로 시작하는 경로만 허용됩니다.")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", field):
+            raise ValueError("폼 필드 이름이 올바르지 않습니다.")
+        if not marker or len(marker) > 200:
+            raise ValueError("응답의 성공 표시를 1~200자로 지정하세요.")
+        if fixed_fields is None:
+            fixed_fields = {}
+        if (not isinstance(fixed_fields, dict) or len(fixed_fields) > 12 or
+                any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", k) or
+                    not isinstance(v, str) or len(v) > 512 for k, v in fixed_fields.items())):
+            raise ValueError("고정 폼 필드는 문자열 12개 이하로 지정하세요.")
+        return dict(fixed_fields)
+
+    def http_prefix_oracle(self, path: str, field: str, alphabet: str, length: int,
+                           success_marker: str, fixed_fields: dict | None = None) -> str:
+        fields = self._oracle_form(path, field, success_marker, fixed_fields)
+        if not 1 <= length <= 12 or not 1 <= len(alphabet) <= 64 or len(set(alphabet)) != len(alphabet):
+            raise ValueError("길이는 1~12, 중복 없는 후보 문자는 1~64자로 지정하세요.")
+        needed = length * len(alphabet)
+        remaining = MAX_BATCH_HTTP_REQUESTS - self.http_batch_requests
+        if needed > remaining:
+            raise ValueError(f"최악의 경우 {needed}회가 필요하지만 자동 반복 요청은 {remaining}회 남았습니다.")
+        deadline = time.monotonic() + MAX_BATCH_SECONDS
+        prefix = ""
+        before = self.http_batch_requests
+        for position in range(length):
+            found = False
+            for char in alphabet:
+                if time.monotonic() >= deadline:
+                    return json.dumps({"status": "timeout", "prefix": prefix,
+                                       "requests": self.http_batch_requests - before}, ensure_ascii=False)
+                fields[field] = prefix + char
+                response = self.http_post(path, urlencode(fields), _batch=True)
+                if (self.http_batch_requests - before) % 12 == 0:
+                    self.event(f"접두사 후보 확인 중: 요청 {self.http_batch_requests - before}/{needed}")
+                if response.startswith("문제 웹 POST 요청 실패"):
+                    return json.dumps({"status": "network_error", "prefix": prefix,
+                                       "requests": self.http_batch_requests - before, "error": response}, ensure_ascii=False)
+                flags = extract_flags(response, self.pattern)
+                if flags:
+                    return json.dumps({"status": "flag_observed", "prefix": prefix + char,
+                                       "flags": flags, "requests": self.http_batch_requests - before}, ensure_ascii=False)
+                if success_marker in response:
+                    prefix += char
+                    found = True
+                    self.event(f"접두사 탐색 {position + 1}/{length}: {prefix}")
+                    break
+            if not found:
+                return json.dumps({"status": "no_match", "prefix": prefix,
+                                   "position": position + 1, "requests": self.http_batch_requests - before}, ensure_ascii=False)
+        return json.dumps({"status": "found", "prefix": prefix,
+                           "requests": self.http_batch_requests - before}, ensure_ascii=False)
+
+    def http_integer_oracle(self, path: str, field: str, start: int, stop: int,
+                            success_marker: str, fixed_fields: dict | None = None) -> str:
+        fields = self._oracle_form(path, field, success_marker, fixed_fields)
+        needed = stop - start + 1
+        if start > stop or needed > MAX_BATCH_HTTP_REQUESTS or needed < 1:
+            raise ValueError("정수 범위는 오름차순이며 최대 300개 값이어야 합니다.")
+        remaining = MAX_BATCH_HTTP_REQUESTS - self.http_batch_requests
+        if needed > remaining:
+            raise ValueError(f"{needed}회가 필요하지만 자동 반복 요청은 {remaining}회 남았습니다.")
+        deadline = time.monotonic() + MAX_BATCH_SECONDS
+        before = self.http_batch_requests
+        for value in range(start, stop + 1):
+            if time.monotonic() >= deadline:
+                return json.dumps({"status": "timeout", "last_value": value - 1,
+                                   "requests": self.http_batch_requests - before}, ensure_ascii=False)
+            fields[field] = str(value)
+            response = self.http_post(path, urlencode(fields), _batch=True)
+            if response.startswith("문제 웹 POST 요청 실패"):
+                return json.dumps({"status": "network_error", "last_value": value,
+                                   "requests": self.http_batch_requests - before, "error": response}, ensure_ascii=False)
+            flags = extract_flags(response, self.pattern)
+            if flags or success_marker in response:
+                return json.dumps({"status": "found", "value": value, "flags": flags,
+                                   "response_excerpt": response[-1600:],
+                                   "requests": self.http_batch_requests - before}, ensure_ascii=False)
+            if (self.http_batch_requests - before) % 25 == 0:
+                self.event(f"정수 범위 탐색 {value}/{stop}")
+        return json.dumps({"status": "no_match", "start": start, "stop": stop,
+                           "requests": self.http_batch_requests - before}, ensure_ascii=False)
 
     def read_service(self) -> None:
         """Read one banner from the user-supplied CTF endpoint; send no bytes initially."""
@@ -1131,6 +1278,7 @@ class Case:
             answer = "정확한 flag를 확인하지 못했습니다. 예시 형식은 정답이 아닙니다.\n\n" + answer
         output = {"run_id": self.id, "model": model, "answer": answer,
                   "flag_candidates": candidates, "flag_observations": self.evidence, "steps": transcript,
+                  "solution_scripts": self.solution_scripts,
                   "requests": self.requests, "parent_id": self.parent_id,
                   "profile": self.profile, "track": self.track, "challenge_mode": self.challenge_mode,
                   "remote_observed_flags": remote_flags,
@@ -1231,8 +1379,10 @@ class Case:
             "For pwn/reversing use inspect_elf, disassemble_function, and targeted binary strings to confirm control flow; never execute supplied native binaries. "
             "For forensics use analyze_binary, inspect_archive, and read_archive_entry. For crypto, use decode_text and offline Python calculations. "
             "If /flag exists only on the remote server and its output is unavailable, state that the exact flag is unknown. "
-            "Use http_get and http_post only when a CTF web origin was explicitly supplied, and only for evidence needed to solve it. "
+            "Use HTTP tools only for the explicitly supplied CTF web origin. For a source-proven finite prefix or integer oracle, "
+            "call http_prefix_oracle or http_integer_oracle to complete the search and inspect the actual response; do not stop at a sample script. "
             "If a CTF TCP endpoint was explicitly supplied, use tcp_exchange to inspect its menu and test a reasoned input sequence. "
+            "If you derive a reusable solution, save its code with save_solution_script; prioritize obtaining the actual result first. "
             "Treat strings marked Fake_Flag, dummy, or decoy as known non-answers; do not stop on them. "
             "Strings observed in a file or banner can be fragments or decoys; verify their role before concluding. "
             "Never present a placeholder such as DH{...} as a candidate. There is no official flag submission." )
@@ -1246,7 +1396,8 @@ class Case:
         transcript = []
         answer = ""
         active_tools = [tool for tool in TOOLS
-                        if (self.web_origin or tool["function"]["name"] not in {"http_get", "http_post"})
+                        if (self.web_origin or tool["function"]["name"] not in {
+                            "http_get", "http_post", "http_prefix_oracle", "http_integer_oracle"})
                         and (self.tcp_endpoint or tool["function"]["name"] != "tcp_exchange")]
         no_call_retries = 0
 
@@ -1301,6 +1452,7 @@ class Case:
                         "발견된 문자열이 실제 정답인지, 조각 또는 미끼인지 아직 확인되지 않았습니다. "
                         + ("사용자가 지정한 CTF TCP 서버에서 tcp_exchange로 메뉴와 입력 결과를 확인하세요. "
                            if tcp_untested else "")
+                        + "유한한 웹 탐색이 필요하면 http_prefix_oracle/http_integer_oracle로 끝까지 확인하세요. "
                         + "inspect_elf, disassemble_function, search_binary_strings 등 사용 가능한 도구로 "
                         "아직 확인하지 않은 근거를 살펴보고 실제 Flag를 계속 추적하세요."
                     )

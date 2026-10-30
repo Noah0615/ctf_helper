@@ -125,7 +125,8 @@ def _openai_tools(allow_http: bool = True, allow_tcp: bool = True) -> list[dict]
     return [{"type": "function", "name": tool["function"]["name"],
              "description": tool["function"]["description"],
              "parameters": tool["function"]["parameters"], "strict": False}
-            for tool in TOOLS if (allow_http or tool["function"]["name"] not in {"http_get", "http_post"})
+            for tool in TOOLS if (allow_http or tool["function"]["name"] not in {
+                "http_get", "http_post", "http_prefix_oracle", "http_integer_oracle"})
             and (allow_tcp or tool["function"]["name"] != "tcp_exchange")]
 
 
@@ -171,6 +172,9 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
         "Never claim a flag is officially accepted. In Korean, explain candidate flags and distinguish input observation, "
         "sandbox-derived results, and guesses. If the exact flag lives only in an unavailable remote /flag file, say it is unknown. "
         "If a CTF web origin was explicitly supplied, use http_get and http_post to inspect that origin and verify evidence. "
+        "When source code exposes a bounded prefix or integer oracle, use http_prefix_oracle or http_integer_oracle "
+        "to finish the search against the supplied CTF origin. Do not stop at pseudocode when the tool can complete it. "
+        "When useful, save a reproducible script with save_solution_script after obtaining evidence; prioritize the actual result. "
         "For pwn/reversing use inspect_elf, disassemble_function and targeted binary strings; never execute uploaded native binaries. "
         "For forensics use analyze_binary, inspect_archive, and read_archive_entry; for crypto use decode_text and offline Python calculations. "
         "If a CTF TCP endpoint was explicitly supplied, use tcp_exchange to inspect its menu and test a reasoned input sequence. "
@@ -250,11 +254,12 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
                     "명시된 CTF 원본의 상대 경로만 사용할 수 있습니다.")})
                 forced_tool_next = "http_get"
                 continue
-            if no_call_retries < 1 and turn < max_steps - 1 and case.evidence:
+            if no_call_retries < 1 and turn < max_steps - 1 and (case.evidence or case.web_origin):
                 no_call_retries += 1
                 inputs.append({"role": "user", "content": (
-                    "관찰된 flag 모양의 문자열이 최종 정답인지 다시 검토하세요. "
-                    "조각·미끼 가능성과 아직 읽지 않은 파일 또는 응답을 확인하고, 필요한 도구를 호출하세요.")})
+                    "아직 실제 서버에서 flag를 확인하지 못했습니다. 조각·미끼 가능성과 남은 검증을 확인하세요. "
+                    "웹 소스에서 유한한 접두사/정수 탐색이 확인되면 http_prefix_oracle 또는 "
+                    "http_integer_oracle로 실행을 완료하고 응답 근거를 확보하세요.")})
                 continue
             answer = response.output_text or "모델이 답변을 생성하지 못했습니다."
             break
