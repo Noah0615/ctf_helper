@@ -1,5 +1,9 @@
 const $ = id => document.getElementById(id);
 let currentRunId = null;
+let activeJobId = null;
+let pollTimer = null;
+let pollFailures = 0;
+let continuationSourceId = null;
 
 const CATEGORY_HINTS = {
   auto: "문제 설명과 첨부 파일을 분석하여 최적의 분석 흐름을 자동으로 결정합니다.",
@@ -137,6 +141,10 @@ dropZone.addEventListener('drop', async e => {
 
 // Reset button
 $('reset-btn').addEventListener('click', () => {
+  activeJobId = null;
+  continuationSourceId = null;
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
   $('form').reset();
   endpointAutoFilled = false;
   $('cat-hint').textContent = CATEGORY_HINTS.auto;
@@ -171,10 +179,11 @@ $('copy-solutions-btn').addEventListener('click', () => {
   navigator.clipboard.writeText($('solutions').textContent);
 });
 
-async function loadHistory() {
+async function loadHistory(selectedId = null) {
   try {
     const list = await (await fetch('/api/history')).json();
     const sel = $('history-select');
+    const wanted = selectedId || sel.value;
     sel.replaceChildren();
     const defaultOpt = document.createElement('option');
     defaultOpt.value = "";
@@ -188,6 +197,7 @@ async function loadHistory() {
       opt.textContent = `${flagInfo}${item.time} (${item.model})${preview}`;
       sel.append(opt);
     }
+    if (wanted && [...sel.options].some(option => option.value === wanted)) sel.value = wanted;
   } catch (e) {
     // Ignore history errors
   }
@@ -196,13 +206,7 @@ async function loadHistory() {
 $('history-select').addEventListener('change', () => {
   const id = $('history-select').value;
   if (!id) return;
-  $('result').hidden = false;
-  $('status').textContent = '저장된 분석 기록 불러오는 중…';
-  $('flags').replaceChildren();
-  $('answer').textContent = '';
-  $('solutions').textContent = '';
-  $('solutions-details').hidden = true;
-  poll(id);
+  startTracking(id, 'history');
 });
 
 async function health() {
@@ -240,8 +244,41 @@ async function health() {
   }
 }
 
+function schedulePoll(id, delay = 1500) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(() => poll(id), delay);
+}
+
+function startTracking(id, mode = 'new', parentId = null) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  activeJobId = id;
+  pollFailures = 0;
+  continuationSourceId = mode === 'continue' ? parentId : null;
+  $('result').hidden = false;
+  $('cost').hidden = true;
+  $('flags').replaceChildren();
+  $('answer').textContent = `새 실행 ID: ${id}\n결과를 기다리는 중입니다.`;
+  $('solutions').textContent = '';
+  $('solutions-details').hidden = true;
+  $('request-log').textContent = '';
+  $('events').textContent = '';
+  $('status').textContent = mode === 'continue' ? '이어서 분석 중…'
+    : mode === 'history' ? '저장된 분석 기록 불러오는 중…' : '분석 시작됨…';
+  $('submit').disabled = true;
+  $('continue-btn').disabled = true;
+  poll(id);
+}
+
 async function poll(id) {
-  const r = await (await fetch(`/api/job/${encodeURIComponent(id)}`)).json();
+  if (activeJobId !== id) return;
+  try {
+  const response = await fetch(`/api/job/${encodeURIComponent(id)}`, {cache: 'no-store'});
+  if (!response.ok) throw new Error(`결과 조회 HTTP ${response.status}`);
+  const r = await response.json();
+  if (activeJobId !== id) return;
+  pollFailures = 0;
+  if (r.status === 'done' && !r.result) throw new Error('완료된 결과 본문이 없습니다.');
   const items = r.result?.flag_candidates || [];
   const observations = r.result?.flag_observations || [];
   const remote = items.filter(item => item.source.startsWith('문제 웹 응답:') || item.source.startsWith('문제 서버:'));
@@ -250,7 +287,7 @@ async function poll(id) {
   $('status').textContent = r.status === 'done'
     ? (remote.length ? '분석 완료 · 문제 서버에서 후보 문자열 관찰'
        : others.length ? '분석 완료 · 미검증 후보 발견' : '분석 완료 · 정확한 flag 미확인')
-    : `상태: ${r.status}`;
+    : r.status === 'running' ? '분석 진행 중…' : `상태: ${r.status}`;
   $('events').textContent = (r.events || []).join('\n');
   if (r.status === 'done') {
     $('flags').replaceChildren();
@@ -304,23 +341,59 @@ async function poll(id) {
     }
 
     $('answer').textContent = r.result.answer + `\n\n실행 ID: ${r.result.run_id}`;
+    const matchingModel = [...$('model').options].find(option => option.value === r.result.model);
+    if (matchingModel && !matchingModel.disabled) $('model').value = r.result.model;
     const scripts = r.result.solution_scripts || [];
     $('solutions').textContent = scripts.map(item => `### ${item.name}\n${item.code}`).join('\n\n');
     $('solutions-details').hidden = scripts.length === 0;
     if (r.result.parent_id) $('answer').textContent += `\n이전 실행 ID: ${r.result.parent_id}`;
     $('request-log').textContent = (r.result.requests || []).map(entry =>
       `${entry.at} ${entry.method} ${entry.path}\n${entry.request_body_preview || ''}\n${entry.response}`).join('\n\n') || '이 실행에서 기록된 요청이 없습니다.';
+    activeJobId = null;
+    pollTimer = null;
+    continuationSourceId = null;
     currentRunId = r.result.run_id;
+    $('continue-note').value = '';
     $('continue-panel').hidden = false;
     $('continue-btn').disabled = false;
     $('submit').disabled = false;
     health();
-    loadHistory();
+    loadHistory(r.result.run_id);
   } else if (r.status === 'failed') {
+    activeJobId = null;
+    pollTimer = null;
+    $('status').textContent = continuationSourceId ? '이어 분석 실패' : '분석 실패';
     $('answer').textContent = `분석 실패: ${r.error}`;
     $('submit').disabled = false;
+    if (continuationSourceId) {
+      currentRunId = continuationSourceId;
+      $('continue-panel').hidden = false;
+      $('continue-btn').disabled = false;
+      continuationSourceId = null;
+    }
   } else {
-    setTimeout(() => poll(id), 1500);
+    schedulePoll(id);
+  }
+  } catch (error) {
+    if (activeJobId !== id) return;
+    pollFailures += 1;
+    if (pollFailures >= 12) {
+      activeJobId = null;
+      pollTimer = null;
+      $('status').textContent = '결과 자동 조회 실패';
+      $('answer').textContent = `실행 ID: ${id}\n서버 연결 상태를 확인한 뒤 최근 분석 기록에서 이 실행을 다시 선택하세요. ${error.message}`;
+      $('submit').disabled = false;
+      if (continuationSourceId) {
+        currentRunId = continuationSourceId;
+        $('continue-panel').hidden = false;
+        $('continue-btn').disabled = false;
+        continuationSourceId = null;
+      }
+      return;
+    }
+    $('status').textContent = `결과 조회 재시도 중… (${pollFailures}회)`;
+    $('answer').textContent = `새 실행 ID: ${id}\n서버 연결이 회복되면 결과를 자동으로 표시합니다. ${error.message}`;
+    schedulePoll(id, Math.min(5000, 1500 + pollFailures * 500));
   }
 }
 
@@ -384,7 +457,7 @@ $('form').addEventListener('submit', async event => {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error);
-    poll(result.job_id);
+    startTracking(result.job_id);
   } catch (e) {
     $('status').textContent = '시작 실패';
     $('answer').textContent = e.message;
@@ -399,18 +472,18 @@ $('continue-btn').addEventListener('click', async () => {
     return;
   }
   $('continue-btn').disabled = true;
-  $('status').textContent = '이전 분석 기록을 불러오는 중…';
+  $('result').hidden = false;
+  $('status').textContent = '이어 분석 요청 중…';
   try {
+    const parentId = currentRunId;
     const response = await fetch('/api/continue', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({run_id: currentRunId, note, model: $('model').value})
+      body: JSON.stringify({run_id: parentId, note, model: $('model').value})
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error);
-    $('continue-note').value = '';
     $('continue-panel').hidden = true;
-    $('events').textContent = '';
-    poll(result.job_id);
+    startTracking(result.job_id, 'continue', parentId);
   } catch (e) {
     $('status').textContent = '이어 분석 시작 실패';
     $('answer').textContent = e.message;
