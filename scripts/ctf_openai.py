@@ -147,17 +147,19 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
     client = OpenAI(api_key=key, timeout=180, max_retries=0)
     del key
     preview = []
-    for p in sorted(case.files_dir.iterdir()):
-        data = p.read_bytes()
+    for p in case.iter_files():
+        with p.open("rb") as source:
+            data = source.read(8192)
+        label = case.file_label(p)
         if is_text(data):
-            preview.append(f"### {p.name}\n" + data.decode("utf-8", errors="replace")[:2500])
+            preview.append(f"### {label}\n" + data.decode("utf-8", errors="replace")[:2500])
         else:
             magic = "binary"
             if data.startswith(b"\x7fELF"): magic = "ELF binary"
             elif data.startswith(b"MZ"): magic = "PE/DOS binary"
             elif data.startswith(b"PK\x03\x04"): magic = "ZIP archive"
             elif data.startswith(b"\x1f\x8b"): magic = "GZIP archive"
-            preview.append(f"### {p.name} [{magic}, {len(data)} bytes] (use analyze_binary or inspect_archive)")
+            preview.append(f"### {label} [{magic}, {p.stat().st_size} bytes] (use analyze_binary or inspect_archive)")
     prompt = ("문제 설명:\n" + case.description + "\n\n입력 파일:\n" + case.list_files() +
               "\n\n텍스트 미리보기:\n" + "\n".join(preview)[:8500]
               + case.continuation_context)

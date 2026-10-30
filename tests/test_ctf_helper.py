@@ -1,5 +1,6 @@
 """Focused offline checks for the local CTF assistant."""
 from types import SimpleNamespace
+import base64
 import io
 import json
 from pathlib import Path
@@ -40,13 +41,35 @@ class HelperTests(unittest.TestCase):
             helper.Case("example", [("A.py", b"x"), ("a.PY", b"y")])
         with self.assertRaises(ValueError):
             helper.Case("example", [("CON.txt", b"x")])
+        with self.assertRaises(ValueError):
+            helper.Case("example", [("folder/../secret.txt", b"x")])
+        with self.assertRaises(ValueError):
+            helper.Case("example", [("folder", b"x"), ("folder/child.txt", b"y")])
+        with self.assertRaisesRegex(ValueError, "256개"):
+            helper.Case("example", [(f"file-{n}.txt", b"") for n in range(257)])
         self.assertEqual(list(Path(self.temp.name).iterdir()), [])
 
     def test_accepts_common_libc_size_within_total_upload_limit(self):
-        case = helper.Case("Inspect libc", [("libc-2.39.so", b"\0" * (6 * 1024 * 1024))])
-        self.assertEqual((case.files_dir / "libc-2.39.so").stat().st_size, 6 * 1024 * 1024)
-        with self.assertRaisesRegex(ValueError, "8 MiB"):
-            helper.Case("Too large", [("large.bin", b"\0" * (9 * 1024 * 1024))])
+        case = helper.Case("Inspect libc", [("libc-2.39.so", b"\0" * (9 * 1024 * 1024))])
+        self.assertEqual((case.files_dir / "libc-2.39.so").stat().st_size, 9 * 1024 * 1024)
+        with self.assertRaisesRegex(ValueError, "32 MiB"):
+            helper.Case("Too large", [("large.bin", b"\0" * (33 * 1024 * 1024))])
+
+    def test_nested_folder_files_are_visible_to_all_file_tools(self):
+        case = helper.Case("Inspect folder", [
+            ("challenge/src/app.py", b"SECRET = 'nested-value'\n"),
+            ("challenge/templates/index.html", b"<h1>hello</h1>"),
+        ])
+        listed = json.loads(case.list_files())
+        self.assertEqual([item["name"] for item in listed],
+                         ["challenge/src/app.py", "challenge/templates/index.html"])
+        self.assertIn("nested-value", case.read_file("challenge/src/app.py"))
+        self.assertIn("challenge/src/app.py:1", case.search_files("nested-value"))
+        with self.assertRaises(ValueError):
+            case.read_file("challenge/../../problem.txt")
+        case.finish(helper.DEFAULT_MODEL, "계속 분석", [])
+        resumed = helper.Case.from_run(case.id, "새 단서")
+        self.assertIn("nested-value", resumed.read_file("challenge/src/app.py"))
 
     def test_reads_files_decodes_and_records_provenance(self):
         case = helper.Case("Decode the encoded text", [("cipher.txt", b"QUNEQ3t0ZXN0X2ZsYWd9")])
@@ -537,9 +560,12 @@ class HelperTests(unittest.TestCase):
 
         with patch.object(web, "RESULTS", Path(self.temp.name)), \
              patch.object(helper, "ollama_request", side_effect=fake_ollama):
-            first_job = post("/api/solve", {"description": "ACDC agent puzzle", "files": [],
+            first_job = post("/api/solve", {"description": "ACDC agent puzzle",
+                                               "files": [{"name": "challenge/src/main.py", "data": base64.b64encode(b"print(1)").decode()}],
                                                "profile": "acdc-2026", "track": "security-for-ai"})
             first = done(first_job["job_id"])
+            self.assertEqual((Path(self.temp.name) / first["run_id"] / "files" /
+                              "challenge" / "src" / "main.py").read_bytes(), b"print(1)")
             second_job = post("/api/continue", {"run_id": first["run_id"],
                                                  "note": "새 단서: fragment ACDC{piece_two}"})
             second = done(second_job["job_id"])

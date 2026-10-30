@@ -39,7 +39,7 @@
     .cat-hint { display: block; font-size: 0.85rem; color: #9bb7d4; background: #0d1624; padding: 0.5rem 0.8rem; border-radius: 6px; border: 1px dashed #2f435e; margin: 0.4rem 0 0.8rem; }
     .drop-zone { border: 2px dashed #364861; border-radius: 8px; padding: 1.2rem; text-align: center; background: #0c1320; cursor: pointer; transition: border-color .15s, background .15s; position: relative; }
     .drop-zone.dragover { border-color: #5bb392; background: #122129; }
-    .drop-zone input[type=file] { position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+    .file-actions { display: flex; justify-content: center; gap: .6rem; margin: .7rem 0; }
     .drop-text { color: #8ea2bc; font-size: 0.92rem; pointer-events: none; }
     .file-badge-list { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.6rem; pointer-events: none; }
     .file-badge { font-size: 0.8rem; background: #1d2b3c; color: #c4d7ec; padding: 0.2rem 0.5rem; border-radius: 4px; border: 1px solid #334862; }
@@ -110,10 +110,15 @@
     <label for="code">코드 직접 붙여넣기 (선택)</label>
     <textarea id="code" placeholder="첨부 파일 대신 짧은 소스 코드나 스크립트를 여기에 붙여넣을 수 있습니다."></textarea>
 
-    <label>문제 파일 또는 아카이브 첨부 (최대 20개, 각 8 MiB, 합계 12 MiB)</label>
+    <label>문제 파일·폴더 또는 아카이브 첨부 (최대 256개, 각 32 MiB, 합계 96 MiB)</label>
     <div id="drop-zone" class="drop-zone">
-      <input id="files" type="file" multiple>
-      <div class="drop-text">📁 파일을 여기에 끌어다 놓거나 클릭하여 선택 (최대 20개, 각 8 MiB, 합계 12 MiB)</div>
+      <div class="drop-text">📁 파일이나 폴더를 끌어다 놓으세요. 폴더 내부 경로가 유지됩니다.</div>
+      <div class="file-actions">
+        <button id="pick-files" type="button">파일 선택</button>
+        <button id="pick-folder" type="button">폴더 선택</button>
+      </div>
+      <input id="files" type="file" multiple hidden>
+      <input id="folder-files" type="file" multiple webkitdirectory directory hidden>
       <div id="file-list" class="file-badge-list"></div>
     </div>
 

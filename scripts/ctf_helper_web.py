@@ -9,7 +9,7 @@ from pathlib import Path
 import threading
 import webbrowser
 
-from ctf_helper import Case, RESULTS, DEFAULT_FLAG_REGEX, DEFAULT_MODEL, OPENAI_MODELS, MAX_FILE_BYTES, MAX_TOTAL_BYTES, check_model
+from ctf_helper import Case, RESULTS, DEFAULT_FLAG_REGEX, DEFAULT_MODEL, OPENAI_MODELS, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, check_model
 from ctf_openai import key_present, get_budget_summary
 
 HOST, PORT = "127.0.0.1", 8765
@@ -118,7 +118,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(403, {"error": "로컬 화면에서만 제출하세요."})
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            max_length = 17 * 1024 * 1024 if self.path == "/api/solve" else 16 * 1024
+            max_length = ((MAX_TOTAL_BYTES + 2) // 3) * 4 + MAX_FILES * 1024 + 1024 * 1024 \
+                if self.path == "/api/solve" else 16 * 1024
             if not 1 <= length <= max_length:
                 raise ValueError("요청 크기가 너무 큽니다.")
             body = json.loads(self.rfile.read(length))
@@ -129,18 +130,21 @@ class Handler(BaseHTTPRequestHandler):
                 case = Case.from_run(str(body["run_id"]), str(body["note"]))
             else:
                 encoded = body.get("files", [])
-                if not isinstance(encoded, list) or len(encoded) > 20:
-                    raise ValueError("파일은 최대 20개까지 선택하세요.")
+                if not isinstance(encoded, list) or len(encoded) > MAX_FILES:
+                    raise ValueError("파일은 최대 256개까지 선택하세요.")
                 files = []
                 size = 0
                 for item in encoded:
-                    raw = base64.b64decode(item["data"], validate=True)
+                    encoded_data = item["data"]
+                    if not isinstance(encoded_data, str) or len(encoded_data) > ((MAX_FILE_BYTES + 2) // 3) * 4:
+                        raise ValueError("파일 하나가 32 MiB를 초과했습니다.")
+                    raw = base64.b64decode(encoded_data, validate=True)
                     if len(raw) > MAX_FILE_BYTES:
-                        raise ValueError("파일 하나가 8 MiB를 초과했습니다.")
+                        raise ValueError("파일 하나가 32 MiB를 초과했습니다.")
                     size += len(raw)
                     files.append((item["name"], raw))
                 if size > MAX_TOTAL_BYTES:
-                    raise ValueError("파일 합계가 12 MiB를 초과했습니다.")
+                    raise ValueError("파일 합계가 96 MiB를 초과했습니다.")
                 case = Case(str(body["description"]), files,
                             str(body.get("flag_regex") or DEFAULT_FLAG_REGEX),
                             bool(body.get("docker_python", False)),

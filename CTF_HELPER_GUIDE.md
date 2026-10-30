@@ -38,7 +38,7 @@ Ollama 서비스가 자동 시작되지 않으면 다른 터미널에서 `ollama
 2. **CTF 분야**: 웹해킹·시스템해킹·리버싱·암호학·포렌식·AI 보안·클라우드/Web3 중 선택합니다. 선택한 분야에 맞는 힌트와 도구 우선순위가 자동 적용됩니다.
    - **대회 프로필**: `2026 ACDC`를 선택하면 `AI for Security`, `Security for AI`, `AI Platform Security` 중 하나를 지정하거나 자동 판별할 수 있습니다. `CTF`와 `KotH` 방식은 분석 지침을 달리합니다. 대회 세부 규칙이 공개되지 않아 KotH 점수 계산이나 자동 점령 기능은 제공하지 않습니다.
 3. **문제 설명 입력**: 문제 제목, 설명, flag 형식 등을 입력합니다. 입력창에 문제 서버 주소(`http://...`, `nc host port` 등)가 있으면 문제 서버 칸에 자동 입력됩니다.
-4. **파일 드래그 앤 드롭**: 문제 파일 또는 ZIP/TAR 아카이브를 드롭존에 끌어다 놓거나 클릭하여 선택합니다 (최대 20개, 파일당 8 MiB, 총 12 MiB).
+4. **파일·폴더 첨부**: `파일 선택`, `폴더 선택` 버튼 또는 파일·폴더 드래그 앤 드롭을 사용합니다 (최대 256개, 파일당 32 MiB, 총 96 MiB). 폴더 내부의 상대 경로가 목록에 표시되고 분석 도구에서 그대로 조회됩니다. 빈 폴더와 심볼릭 링크는 첨부하지 않습니다. 큰 폴더는 브라우저에서 읽고 전송하는 데 시간이 걸릴 수 있습니다.
    - ELF 파일은 보호 기법·함수 심볼·선택한 함수의 디스어셈블리까지 분석할 수 있습니다.
    - 사용자 입력이 명시된 TCP CTF 서버에만 제한된 메뉴 입력을 보내 결과를 확인할 수 있습니다. 이 도구는 실행당 새 연결을 만들고, 최대 8회·호출당 12단계·총 4 KiB 입력으로 제한됩니다.
 5. **문제 서버 연결 (선택)**:
@@ -60,8 +60,8 @@ Ollama 서비스가 자동 시작되지 않으면 다른 터미널에서 `ollama
 
 | 도구 이름 | 기능 및 설명 |
 |---|---|
-| `list_files` / `read_file` | 사용자가 첨부한 파일 목록 조회 및 텍스트/16진수 미리보기 |
-| `search_files` | 첨부된 텍스트 파일 내 키워드 대소문자 무시 고속 검색 |
+| `list_files` / `read_file` | 하위 폴더를 포함한 첨부 파일 목록 조회 및 상대 경로로 텍스트/16진수 미리보기 |
+| `search_files` | 하위 폴더를 포함한 텍스트 파일 내 키워드 대소문자 무시 검색 |
 | `decode_text` | Base64, Base32, Base85, Hex(공백/접두사 허용), URL 디코드, HTML 엔티티, 8비트 바이너리 ASCII, ROT13 및 Caesar 전단(Flag 매칭 자동 감지), 문자열 역순 변환 |
 | `analyze_binary` | 파일 실행 없이 시그니처(ELF, PE, Mach-O, PCAP/PCAPNG, GZIP, BZIP2, 7z, XZ, SQLite, PDF, PNG/JPEG), 엔트로피, 인쇄 가능 문자열(ASCII 및 UTF-16LE 광범위 추출), ELF PIE 보호 여부 분석 및 flag 자동 탐색 |
 | `inspect_archive` | 디스크 추출 없이 ZIP 및 TAR 아카이브 파일 목록/압축률 확인 및 내부 소형 텍스트 파일 flag 자동 추출 |
@@ -94,6 +94,7 @@ PowerShell 터미널에서 직접 문제를 분석할 수 있습니다.
 ### 주요 CLI 옵션
 - `--problem "문자열"` 또는 `--problem-file .\경로.txt`: 문제 설명 지정
 - `--file .\경로`: 첨부 파일 (여러 개일 경우 `--file`을 반복 사용)
+- `--file .\문제폴더`: 폴더 안 파일을 재귀적으로 첨부하고 폴더 이름부터 상대 경로 보존
 - `--model`: `qwen3:8b`(기본값), `gpt-5.4-mini`, `gpt-5.4`. 기본 Ollama 태그는 `CTF_HELPER_OLLAMA_MODEL`로 변경 가능
 - `--tcp-endpoint ctf.example:1337` 또는 `http://ctf.example:8080/`: 명시한 CTF 문제 서버에 연결
 - `--category web|pwn|reversing|crypto|forensics|ai-security|cloud-web3`: CTF 분야 지정

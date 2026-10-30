@@ -42,23 +42,65 @@ $('description').addEventListener('input', () => {
   else if (endpointAutoFilled) { $('tcp-endpoint').value = ''; endpointAutoFilled = false; }
 });
 
-// File list badges & Drag-and-drop
+// Preserve relative paths for files selected from folders or dropped directories.
+const MAX_FILES = 256;
+const MAX_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 96 * 1024 * 1024;
+let selectedFiles = [];
+
+function addSelectedFiles(items) {
+  const byPath = new Map(selectedFiles.map(item => [item.path.toLowerCase(), item]));
+  for (const item of items) byPath.set(item.path.toLowerCase(), item);
+  selectedFiles = [...byPath.values()];
+  updateFileList();
+}
+
 function updateFileList() {
   const listEl = $('file-list');
   listEl.replaceChildren();
-  const files = $('files').files;
-  if (!files || !files.length) return;
-  for (const f of files) {
+  if (!selectedFiles.length) return;
+  const total = selectedFiles.reduce((sum, item) => sum + item.file.size, 0);
+  const summary = document.createElement('div');
+  summary.textContent = `파일 ${selectedFiles.length}개 · 합계 ${(total / (1024 * 1024)).toFixed(2)} MiB`;
+  listEl.append(summary);
+  for (const {file, path} of selectedFiles) {
     const badge = document.createElement('span');
     badge.className = 'file-badge';
-    const size = f.size >= 1024 * 1024
-      ? `${(f.size / (1024 * 1024)).toFixed(2)} MiB`
-      : `${(f.size / 1024).toFixed(1)} KiB`;
-    badge.textContent = `${f.name} (${size})`;
+    const size = file.size >= 1024 * 1024
+      ? `${(file.size / (1024 * 1024)).toFixed(2)} MiB`
+      : `${(file.size / 1024).toFixed(1)} KiB`;
+    badge.textContent = `${path} (${size})`;
     listEl.append(badge);
   }
 }
-$('files').addEventListener('change', updateFileList);
+$('pick-files').addEventListener('click', () => $('files').click());
+$('pick-folder').addEventListener('click', () => $('folder-files').click());
+$('files').addEventListener('change', () => {
+  addSelectedFiles([...$('files').files].map(file => ({file, path: file.name})));
+  $('files').value = '';
+});
+$('folder-files').addEventListener('change', () => {
+  addSelectedFiles([...$('folder-files').files].map(file =>
+    ({file, path: file.webkitRelativePath || file.name})));
+  $('folder-files').value = '';
+});
+
+async function filesInEntry(entry, prefix = '') {
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+    return [{file, path: prefix + file.name}];
+  }
+  if (!entry.isDirectory) return [];
+  const reader = entry.createReader();
+  const children = [];
+  while (true) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    if (!batch.length) break;
+    children.push(...batch);
+  }
+  const nested = await Promise.all(children.map(child => filesInEntry(child, prefix + entry.name + '/')));
+  return nested.flat();
+}
 
 const dropZone = $('drop-zone');
 ['dragenter', 'dragover'].forEach(name => {
@@ -67,10 +109,19 @@ const dropZone = $('drop-zone');
 ['dragleave', 'drop'].forEach(name => {
   dropZone.addEventListener(name, e => { e.preventDefault(); dropZone.classList.remove('dragover'); });
 });
-dropZone.addEventListener('drop', e => {
-  if (e.dataTransfer && e.dataTransfer.files.length) {
-    $('files').files = e.dataTransfer.files;
-    updateFileList();
+dropZone.addEventListener('drop', async e => {
+  if (!e.dataTransfer) return;
+  try {
+    const entries = [...(e.dataTransfer.items || [])]
+      .filter(item => item.kind === 'file')
+      .map(item => item.getAsEntry?.() || item.webkitGetAsEntry?.())
+      .filter(Boolean);
+    const picked = entries.length
+      ? (await Promise.all(entries.map(entry => filesInEntry(entry)))).flat()
+      : [...e.dataTransfer.files].map(file => ({file, path: file.name}));
+    addSelectedFiles(picked);
+  } catch (error) {
+    $('status').textContent = `폴더 읽기 실패: ${error.message}`;
   }
 });
 
@@ -90,6 +141,7 @@ $('reset-btn').addEventListener('click', () => {
   endpointAutoFilled = false;
   $('cat-hint').textContent = CATEGORY_HINTS.auto;
   $('file-list').replaceChildren();
+  selectedFiles = [];
   $('result').hidden = true;
   $('status').textContent = '';
   $('flags').replaceChildren();
@@ -273,24 +325,29 @@ $('form').addEventListener('submit', async event => {
   $('flags').replaceChildren();
   $('answer').textContent = '';
   try {
-    const picked = [...$('files').files];
-    if (picked.length > 20 || picked.some(file => file.size > 8 * 1024 * 1024) ||
-        picked.reduce((sum, file) => sum + file.size, 0) > 12 * 1024 * 1024)
-      throw new Error('파일은 최대 20개, 파일당 8 MiB, 합계 12 MiB까지 허용됩니다.');
-    const files = await Promise.all(picked.map(file => new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve({name: file.name, data: String(reader.result).split(',')[1]});
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    })));
+    const picked = selectedFiles;
+    if (picked.length > MAX_FILES || picked.some(({file}) => file.size > MAX_FILE_BYTES) ||
+        picked.reduce((sum, {file}) => sum + file.size, 0) > MAX_TOTAL_BYTES)
+      throw new Error('파일은 최대 256개, 파일당 32 MiB, 합계 96 MiB까지 허용됩니다.');
+    const files = [];
+    for (const {file, path} of picked) {
+      $('status').textContent = `파일 읽는 중… ${files.length + 1}/${picked.length}`;
+      const data = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(',')[1]);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+      files.push({name: path, data});
+    }
     if ($('code').value.trim()) {
       if (files.some(file => file.name.toLowerCase() === 'pasted_code.txt'))
         throw new Error('pasted_code.txt 파일 이름이 붙여넣은 코드와 중복됩니다.');
       const bytes = new TextEncoder().encode($('code').value);
-      if (bytes.length > 8 * 1024 * 1024) throw new Error('붙여넣은 코드가 8 MiB를 초과했습니다.');
-      if (picked.length + 1 > 20 ||
-          picked.reduce((sum, file) => sum + file.size, bytes.length) > 12 * 1024 * 1024)
-        throw new Error('첨부 파일과 붙여넣은 코드는 합계 20개, 12 MiB를 초과할 수 없습니다.');
+      if (bytes.length > MAX_FILE_BYTES) throw new Error('붙여넣은 코드가 32 MiB를 초과했습니다.');
+      if (picked.length + 1 > MAX_FILES ||
+          picked.reduce((sum, {file}) => sum + file.size, bytes.length) > MAX_TOTAL_BYTES)
+        throw new Error('첨부 파일과 붙여넣은 코드는 합계 256개, 96 MiB를 초과할 수 없습니다.');
       let binary = '';
       for (const byte of bytes) binary += String.fromCharCode(byte);
       files.push({name: 'pasted_code.txt', data: btoa(binary)});

@@ -32,9 +32,9 @@ OLLAMA = "http://127.0.0.1:11434"
 DEFAULT_MODEL = os.environ.get("CTF_HELPER_OLLAMA_MODEL", "qwen3:8b").strip() or "qwen3:8b"
 OPENAI_MODELS = ("gpt-5.4-mini", "gpt-5.4")
 DEFAULT_FLAG_REGEX = r"(?:ACDC|FLAG|CTF|DH|APS)\{[^}\r\n]{1,160}\}"
-MAX_FILES = 20
-MAX_FILE_BYTES = 8 * 1024 * 1024
-MAX_TOTAL_BYTES = 12 * 1024 * 1024
+MAX_FILES = 256
+MAX_FILE_BYTES = 32 * 1024 * 1024
+MAX_TOTAL_BYTES = 96 * 1024 * 1024
 MAX_DESCRIPTION = 16000
 DECLARED_FLAG_FORMAT = re.compile(
     r"(?:flag\s*format|플래그(?:의)?\s*형식)\s*(?:[:：은는]\s*)?[`* ]*([A-Za-z][A-Za-z0-9_]{1,23})\s*\{",
@@ -73,6 +73,16 @@ def checked_name(name: str) -> str:
     if stem in {"CON", "PRN", "AUX", "NUL"} or stem in {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}:
         raise ValueError("Windows 예약 파일 이름은 사용할 수 없습니다.")
     return name
+
+
+def checked_relative_path(name: str) -> str:
+    """Accept a browser-supplied folder path without allowing traversal or absolute paths."""
+    if not isinstance(name, str) or not name or len(name) > 1024 or name.startswith(("/", "\\")):
+        raise ValueError("파일 경로가 올바르지 않습니다.")
+    parts = name.split("/")
+    if len(parts) > 32 or any(not part for part in parts):
+        raise ValueError("파일 경로는 32단계 이하의 상대 경로여야 합니다.")
+    return "/".join(checked_name(part) for part in parts)
 
 
 def is_text(data: bytes) -> bool:
@@ -246,10 +256,10 @@ class Case:
         if not description.strip() or len(description) > MAX_DESCRIPTION:
             raise ValueError("문제 설명은 1~16,000자로 입력하세요.")
         if len(files) > MAX_FILES or sum(len(data) for _, data in files) > MAX_TOTAL_BYTES:
-            raise ValueError("파일은 최대 20개, 합계 12 MiB까지 업로드할 수 있습니다.")
+            raise ValueError("파일은 최대 256개, 합계 96 MiB까지 업로드할 수 있습니다.")
         if any(len(data) > MAX_FILE_BYTES for _, data in files):
-            raise ValueError("파일 하나는 8 MiB 이하로 지정하세요.")
-        names = [checked_name(name) for name, _ in files]
+            raise ValueError("파일 하나는 32 MiB 이하로 지정하세요.")
+        names = [checked_relative_path(name) for name, _ in files]
         conflict = flag_format_conflict(description, files)
         if conflict and not allow_mismatch:
             raise ValueError(conflict)
@@ -273,7 +283,17 @@ class Case:
         self.cookie_jar = http.cookiejar.CookieJar()
         self.remote_archives: dict[str, str] = {}
         if len({name.casefold() for name in names}) != len(names):
-            raise ValueError("중복된 파일 이름이 있습니다.")
+            raise ValueError("중복된 파일 경로가 있습니다.")
+        file_keys = {name.casefold() for name in names}
+        directory_names: dict[str, str] = {}
+        for name in names:
+            parts = name.split("/")
+            for depth in range(1, len(parts)):
+                directory = "/".join(parts[:depth])
+                key = directory.casefold()
+                if key in file_keys or (key in directory_names and directory_names[key] != directory):
+                    raise ValueError("파일 경로가 폴더 또는 다른 경로와 충돌합니다.")
+                directory_names[key] = directory
         self.pattern = get_flag_pattern(flag_regex)
         self.id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
         self.root_id = root_id or self.id
@@ -285,9 +305,11 @@ class Case:
         self.event = event or (lambda message: None)
         self.evidence: list[dict] = []
         self.requests: list[dict] = []
-        for name, data in files:
-            (self.files_dir / name).write_bytes(data)
-            self._record_flags(data.decode("utf-8", errors="replace"), f"입력 파일: {name}")
+        for name, (_, data) in zip(names, files):
+            target = self.files_dir.joinpath(*name.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            self._record_flags(data[:200_000].decode("utf-8", errors="replace"), f"입력 파일: {name}")
         self._record_flags(description, "문제 설명")
         if continuation_note:
             self._record_flags(continuation_note, "추가 관찰")
@@ -315,8 +337,16 @@ class Case:
         meta_path = previous / "case.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
         source_dir = previous / "files"
-        names = meta.get("uploaded_names") or [p.name for p in source_dir.iterdir() if p.is_file()]
-        files = [(checked_name(name), (source_dir / checked_name(name)).read_bytes()) for name in names]
+        names = meta["uploaded_names"] if "uploaded_names" in meta else [
+            p.relative_to(source_dir).as_posix()
+            for p in source_dir.rglob("*") if p.is_file() and not p.is_symlink()]
+        files = []
+        for name in names:
+            safe_name = checked_relative_path(name)
+            source = source_dir.joinpath(*safe_name.split("/"))
+            if not source.is_file() or source.is_symlink() or not source.resolve().is_relative_to(source_dir.resolve()):
+                raise ValueError("이전 분석의 첨부 파일을 안전하게 읽을 수 없습니다.")
+            files.append((safe_name, source.read_bytes()))
         case = cls((previous / "problem.txt").read_text(encoding="utf-8"), files,
                    flag_regex=meta.get("flag_regex", DEFAULT_FLAG_REGEX),
                    docker_python=bool(meta.get("docker_python", False)), event=event,
@@ -327,15 +357,20 @@ class Case:
                    continuation_note=note.strip(), root_id=meta.get("root_id", run_id))
         extra_bytes = 0
         copied_extra = []
-        for item in sorted(source_dir.iterdir()):
-            if item.name in names or not item.is_file() or item.is_symlink():
+        for item in sorted(source_dir.rglob("*")):
+            relative = item.relative_to(source_dir).as_posix()
+            if relative in names or not item.is_file() or item.is_symlink():
                 continue
             size = item.stat().st_size
-            if size > MAX_FILE_BYTES or extra_bytes + size > 16 * 1024 * 1024 or len(copied_extra) >= 20:
+            if size > MAX_FILE_BYTES or extra_bytes + size > MAX_TOTAL_BYTES or len(copied_extra) >= 32:
                 continue
-            checked_name(item.name)
-            shutil.copyfile(item, case.files_dir / item.name)
-            copied_extra.append(item.name)
+            checked_relative_path(relative)
+            if not item.resolve().is_relative_to(source_dir.resolve()):
+                continue
+            destination = case.files_dir.joinpath(*relative.split("/"))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(item, destination)
+            copied_extra.append(relative)
             extra_bytes += size
         previous_evidence = result.get("flag_observations", result.get("flag_candidates", []))
         case.evidence = [item for item in previous_evidence if isinstance(item, dict)]
@@ -425,14 +460,24 @@ class Case:
             out.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def _file(self, name: str) -> Path:
-        path = self.files_dir / checked_name(name)
-        if not path.is_file() or path.is_symlink():
+        path = self.files_dir.joinpath(*checked_relative_path(name).split("/"))
+        if (not path.is_file() or path.is_symlink() or
+                not path.resolve().is_relative_to(self.files_dir.resolve())):
             raise ValueError("해당 입력 파일이 없습니다.")
         return path
 
+    def iter_files(self) -> list[Path]:
+        root = self.files_dir.resolve()
+        return sorted((p for p in self.files_dir.rglob("*")
+                       if p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(root)),
+                      key=lambda p: p.relative_to(self.files_dir).as_posix().casefold())
+
+    def file_label(self, path: Path) -> str:
+        return path.relative_to(self.files_dir).as_posix()
+
     def list_files(self) -> str:
-        return json.dumps([{"name": p.name, "bytes": p.stat().st_size}
-                           for p in sorted(self.files_dir.iterdir()) if p.is_file()], ensure_ascii=False)
+        return json.dumps([{"name": self.file_label(p), "bytes": p.stat().st_size}
+                           for p in self.iter_files()], ensure_ascii=False)
 
     def read_file(self, name: str, start_line: int = 1) -> str:
         path = self._file(name)
@@ -447,13 +492,13 @@ class Case:
         if not term or len(term) > 120:
             return "검색어는 1~120자여야 합니다."
         hits = []
-        for p in sorted(self.files_dir.iterdir()):
+        for p in self.iter_files():
             data = p.read_bytes()
             if not is_text(data):
                 continue
             for n, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
                 if term.casefold() in line.casefold():
-                    hits.append(f"{p.name}:{n}: {line[:220]}")
+                    hits.append(f"{self.file_label(p)}:{n}: {line[:220]}")
                     if len(hits) == 60:
                         return "\n".join(hits)
         return "\n".join(hits) or "일치 항목 없음"
@@ -1156,17 +1201,19 @@ class Case:
         self.event("Ollama 모델 확인 중")
         check_model(model)
         preview = []
-        for p in sorted(self.files_dir.iterdir()):
-            data = p.read_bytes()
+        for p in self.iter_files():
+            with p.open("rb") as source:
+                data = source.read(8192)
+            label = self.file_label(p)
             if is_text(data):
-                preview.append(f"### {p.name}\n" + data.decode("utf-8", errors="replace")[:2500])
+                preview.append(f"### {label}\n" + data.decode("utf-8", errors="replace")[:2500])
             else:
                 magic = "binary"
                 if data.startswith(b"\x7fELF"): magic = "ELF binary"
                 elif data.startswith(b"MZ"): magic = "PE/DOS binary"
                 elif data.startswith(b"PK\x03\x04"): magic = "ZIP archive"
                 elif data.startswith(b"\x1f\x8b"): magic = "GZIP archive"
-                preview.append(f"### {p.name} [{magic}, {len(data)} bytes] (use analyze_binary or inspect_archive)")
+                preview.append(f"### {label} [{magic}, {p.stat().st_size} bytes] (use analyze_binary or inspect_archive)")
         guidance = self.analysis_guidance()
         system_content = (
             f"You are a CTF study assistant for category: {self.category}. {guidance} "
@@ -1323,9 +1370,19 @@ def main() -> None:
         description = args.problem if args.problem else args.problem_file.read_text(encoding="utf-8")
         files = []
         for path in args.file:
-            if path.stat().st_size > MAX_FILE_BYTES:
-                p.error(f"파일 하나는 8 MiB 이하로 지정하세요: {path}")
-            files.append((path.name, path.read_bytes()))
+            if path.is_dir():
+                for child in sorted(path.rglob("*")):
+                    if child.is_symlink() or not child.is_file():
+                        continue
+                    if child.stat().st_size > MAX_FILE_BYTES:
+                        p.error(f"파일 하나는 32 MiB 이하로 지정하세요: {child}")
+                    files.append((path.name + "/" + child.relative_to(path).as_posix(), child.read_bytes()))
+            else:
+                if path.stat().st_size > MAX_FILE_BYTES:
+                    p.error(f"파일 하나는 32 MiB 이하로 지정하세요: {path}")
+                files.append((path.name, path.read_bytes()))
+            if len(files) > MAX_FILES or sum(len(data) for _, data in files) > MAX_TOTAL_BYTES:
+                p.error("파일은 최대 256개, 합계 96 MiB까지 지정하세요.")
         case = Case(description, files, args.flag_regex, args.docker_python,
                     event=lambda msg: print(msg, flush=True), tcp_endpoint=args.tcp_endpoint,
                     category=args.category, allow_mismatch=args.allow_mismatch,
