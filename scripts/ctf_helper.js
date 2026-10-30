@@ -12,7 +12,7 @@ const CATEGORY_HINTS = {
   reversing: "파일 매직, 엔트로피, 인쇄 가능 문자열(ASCII/UTF-16LE), 디스어셈블리 및 상수/인코딩 분석.",
   crypto: "암호 알고리즘(RSA, AES, XOR, PRNG), 취약한 키/파라미터 분석. decode_text 및 오프라인 Python 계산 활용.",
   forensics: "파일 시그니처, 메타데이터, 아카이브 구조(inspect_archive, read_archive_entry), 바이너리 문자열 검사.",
-  "ai-security": "프롬프트 템플릿, 탈옥(Jailbreak) 패턴, 시스템 프롬프트 누출, 모델 가중치/설정 파일 분석.",
+  "ai-security": "AI ?? ??: ?? ???(SafeTensors, GGUF, Pickle) ??, ???? RCE ??, ???? ???(??/?? ???/??? ??) ?? ?? ? ??.",
   "cloud-web3": "클라우드 IAM 정책, Docker/K8s 설정, 스마트 컨트랙트 재진입/정수 연산 및 환경 변수 분석.",
   other: "문제 설명 및 첨부 파일 중심 범용 정적 분석."
 };

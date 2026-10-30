@@ -73,7 +73,7 @@ CATEGORY_GUIDANCE = {
     "reversing": "Analyze file magic, printable strings, disassembly, encryption routines, and constant tables. Use inspect_elf, disassemble_function, search_binary_strings, and find_string_xrefs to trace string usage.",
     "crypto": "Analyze cipher algorithms (RSA, AES, XOR, PRNG). Use extract_crypto_params to parse public parameters (n, e, c, p, q) and generate attack scripts, and run_python to compute solutions.",
     "forensics": "Inspect file signatures and headers. Use carve_file_signatures to find hidden overlays/stego, inspect_pcap for packet captures, and inspect_archive/read_archive_entry for compressed files.",
-    "ai-security": "Examine prompt templates, jailbreak patterns, system prompt leakage, model weights, and API configs.",
+    "ai-security": "Analyze AI security vectors: 1) Model weights/serialization: use inspect_ai_model to inspect SafeTensors metadata, GGUF keys, and PyTorch/pickle bytecode for hidden flags or RCE; 2) Deserialization exploits: use craft_pickle_exploit for torch.load / pickle.loads targets; 3) Prompt injection: use craft_prompt_injections to generate direct overrides, refusal suppression, encoding bypasses (Base64/NATO), and delimiter breakouts, then test them via http_post or tcp_exchange.",
     "cloud-web3": "Review cloud IAM policies, Docker configs, environment secrets, and smart contract logic flow.",
     "other": "Perform general static analysis and problem description review.",
 }
@@ -286,6 +286,12 @@ TOOLS = [
                 {"name": {"type": "string"}}, ["name"]),
     tool_schema("diff_http_responses", "Compare two HTTP responses from paths or raw bodies to detect boolean SQLi / oracle markers",
                 {"path1": {"type": "string"}, "path2": {"type": "string"}, "body1": {"type": "string"}, "body2": {"type": "string"}}, []),
+    tool_schema("inspect_ai_model", "Safely inspect AI model files (.safetensors, .pt, .pth, .pkl, .gguf, .onnx) without executing them; detect malicious pickle RCE opcodes, extract metadata, and find hidden flags",
+                {"name": {"type": "string"}}, ["name"]),
+    tool_schema("craft_prompt_injections", "Generate battle-tested prompt injection and jailbreak payloads (direct override, refusal suppression, encoding bypass, delimiter escape) for LLM CTF targets",
+                {"goal": {"type": "string"}, "defense_hint": {"type": "string"}, "target_service": {"type": "string"}}, []),
+    tool_schema("craft_pickle_exploit", "Generate PyTorch / Pickle deserialization RCE exploit payloads (using __reduce__) for CTF challenges where torch.load or pickle.loads is executed",
+                {"command": {"type": "string"}}, []),
 ]
 
 
@@ -1039,6 +1045,20 @@ class Case:
                     label2 = str(args["path2"])
                     body2 = self.http_get(label2)
                 result = diff_http_responses(str(body1 or ""), str(body2 or ""), label1, label2)
+            elif name == "inspect_ai_model":
+                from ctf_ai_security import inspect_ai_model
+                file_name = str(args["name"])
+                res = inspect_ai_model(self._file(file_name))
+                self._record_flags(res, f"AI ?? ??: {file_name}")
+                result = res
+            elif name == "craft_prompt_injections":
+                from ctf_ai_security import craft_prompt_injections
+                result = craft_prompt_injections(str(args.get("goal", "leak_flag")),
+                                                str(args.get("defense_hint", "")),
+                                                str(args.get("target_service", "http")))
+            elif name == "craft_pickle_exploit":
+                from ctf_ai_security import craft_pickle_exploit
+                result = craft_pickle_exploit(str(args.get("command", "cat flag")))
         except (ValueError, KeyError, TypeError) as exc:
             result = f"도구 입력 오류: {exc}"
 
@@ -1524,7 +1544,7 @@ class Case:
             "In your final answer, give a concise Korean explanation, exact candidate flag(s) if found, "
             "and distinguish observed input, sandbox-derived, and unverified guesses. "
             "For pwn/reversing use inspect_elf, disassemble_function, and targeted binary strings to confirm control flow; never execute supplied native binaries. "
-            "For forensics use analyze_binary, inspect_archive, and read_archive_entry. For crypto, use decode_text and offline Python calculations. "
+            "For forensics use analyze_binary, inspect_archive, and read_archive_entry. For crypto, use decode_text, extract_crypto_params, and offline Python calculations. For AI security (ai-security), use inspect_ai_model to check SafeTensors/GGUF metadata and PyTorch/pickle bytecode for hidden flags or RCE; use craft_prompt_injections for LLM jailbreak and system prompt extraction; use craft_pickle_exploit for torch.load / pickle.loads targets. "
             "If /flag exists only on the remote server and its output is unavailable, state that the exact flag is unknown. "
             "Use HTTP tools only for the explicitly supplied CTF web origin. For a source-proven finite prefix or integer oracle, "
             "call http_prefix_oracle or http_integer_oracle to complete the search and inspect the actual response; do not stop at a sample script. "

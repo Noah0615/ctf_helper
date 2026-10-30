@@ -189,7 +189,7 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
         "to finish the search against the supplied CTF origin. Do not stop at pseudocode when the tool can complete it. "
         "When useful, save a reproducible script with save_solution_script after obtaining evidence; prioritize the actual result. "
         "For pwn/reversing use inspect_elf, disassemble_function and targeted binary strings; never execute uploaded native binaries. "
-        "For forensics use analyze_binary, inspect_archive, and read_archive_entry; for crypto use decode_text and offline Python calculations. "
+        "For forensics use analyze_binary, inspect_archive, and read_archive_entry; for crypto use decode_text, extract_crypto_params, and offline Python calculations. For AI security (ai-security), use inspect_ai_model to check SafeTensors/GGUF metadata and PyTorch/pickle bytecode for hidden flags or RCE; use craft_prompt_injections for LLM jailbreak and system prompt extraction; use craft_pickle_exploit for torch.load / pickle.loads targets. "
         "If a CTF TCP endpoint was explicitly supplied, use tcp_exchange to inspect its menu and test a reasoned input sequence. "
         "Fake_Flag, dummy and decoy strings are known non-answers. Never present placeholders like DH{...} as candidates. "
         "A flag-shaped string in a file or banner may be a fragment or decoy; verify its role before concluding. "
