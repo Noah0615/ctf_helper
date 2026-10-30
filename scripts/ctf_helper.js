@@ -214,6 +214,20 @@ async function health() {
     const r = await (await fetch('/api/health')).json();
     const ollamaEl = $('health-ollama');
     const openaiEl = $('health-openai');
+    const airllm = r.airllm;
+    const airllmEl = $('health-airllm');
+    const airllmOption = [...$('model').options].find(option => option.value === 'airllm:qwen3-14b');
+    if (airllmEl) {
+      airllmEl.textContent = airllm?.ready ? `AirLLM: 준비됨 · Qwen3-14B${airllm.state === 'generating' ? ' · 생성 중' : ''}`
+        : airllm?.state === 'loading' ? 'AirLLM: 다운로드·레이어 변환 중…' : 'AirLLM: 별도 서버 준비 필요';
+      airllmEl.className = `health-pill ${airllm?.ready ? 'health-ok' : 'health-warn'}`;
+      airllmEl.title = airllm?.error || '';
+    }
+    if (airllmOption) {
+      airllmOption.disabled = !airllm?.ready;
+      airllmOption.textContent = airllm?.ready ? 'AirLLM Qwen3-14B (로컬 · 레이어 스트리밍, 느림)'
+        : 'AirLLM Qwen3-14B (별도 서버 준비 필요)';
+    }
     if (r.ollama?.model) $('model').options[0].value = r.ollama.model;
 
     if (r.ollama && r.ollama.ready) {
@@ -517,7 +531,8 @@ $('continue-btn').addEventListener('click', async () => {
     const parentId = currentRunId;
     const response = await fetch('/api/continue', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({run_id: parentId, note, model: $('model').value})
+      body: JSON.stringify({run_id: parentId, note, model: $('model').value,
+        think_mode: $('think-mode') ? $('think-mode').value : 'quick'})
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error);
@@ -532,6 +547,7 @@ $('continue-btn').addEventListener('click', async () => {
 
 health();
 loadHistory();
+$('refresh-models-btn')?.addEventListener('click', health);
 
 $('pause-btn')?.addEventListener('click', async () => {
   if (!activeJobId) return;
@@ -556,7 +572,7 @@ $('resume-btn')?.addEventListener('click', async () => {
 });
 
 $('model')?.addEventListener('change', () => {
-  const isOllama = $('model').value.startsWith('lab-') || $('model').value.startsWith('qwen');
+  const isOllama = !$('model').value.startsWith('gpt-');
   if ($('think-mode-container')) {
     $('think-mode-container').style.display = isOllama ? 'block' : 'none';
   }

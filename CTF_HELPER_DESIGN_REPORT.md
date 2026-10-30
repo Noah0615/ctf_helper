@@ -1,5 +1,7 @@
 # CTF 풀이 도우미 시스템 설계 및 구현 검증 보고서
 
+**2026-10-31 추가:** AirLLM Qwen3-14B를 선택적으로 연결한다. CTF 웹 서버는 표준 라이브러리 클라이언트로 loopback AirLLM 서버에 채팅·도구 스키마를 전달하며, 별도 CUDA 프로세스가 Qwen 채팅 템플릿과 레이어 스트리밍을 담당한다. 모델 미준비 시 UI 선택과 제출을 차단하고 상태·오류를 표시한다. 도구 호출 파싱, 기존 분석 루프 전달, 이어 분석 모델 유지 테스트를 추가했다. 실제 GPU의 처리 속도와 문제 풀이 성공률은 별도 측정 대상이다. 설치와 한계는 [AirLLM 안내](AIRLLM_GUIDE.md)에 기록한다.
+
 **검증 기준:** 2026-10-29 현재 저장소의 `scripts/ctf_helper.py`, `scripts/ctf_openai.py`, `scripts/ctf_helper_web.py`, `scripts/ctf_helper.js`, `scripts/ctf_helper.html`, `tests/test_ctf_helper.py`
 **범위:** 현재 코드에서 확인되는 동작과 테스트 결과. 모델 성능, 외부 서비스 요금, 실제 CTF 정답률 및 보안성 전체를 입증하는 보고서는 아니다.
 

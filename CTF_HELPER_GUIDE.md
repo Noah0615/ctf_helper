@@ -1,5 +1,7 @@
 # CTF 풀이 도우미 가이드
 
+AirLLM Qwen3-14B를 추가로 사용할 수 있습니다. 별도 CUDA 환경 설치, 레이어 캐시, 실행 명령은 [AirLLM 안내](AIRLLM_GUIDE.md)를 참고하세요. 기본 CTF 도우미 환경에는 무거운 모델 패키지를 설치하지 않습니다.
+
 문제 설명과 코드/첨부 파일을 입력하면 로컬 Ollama(Qwen3 8B) 또는 OpenAI Responses API(GPT-5.4 Mini / GPT-5.4)가 분석 근거와 flag 후보를 제시합니다. 웹·시스템·리버싱·암호·포렌식·AI 보안·클라우드/Web3 분야를 선택할 수 있으며, 분야별 맞춤 지침과 도구가 자동으로 적용됩니다.
 
 ---
@@ -9,6 +11,7 @@
 | 모델 | 구동 환경 | 특징 및 용도 | 비용 / 과금 한도 |
 |---|---|---|---|
 | **로컬 Qwen3 8B** (`qwen3:8b`) | 로컬 Ollama | 로컬 GPU/CPU 구동 | OpenAI API 사용료 없음 |
+| **AirLLM Qwen3-14B** (`airllm:qwen3-14b`) | 별도 로컬 CUDA 서버 | SSD 레이어 스트리밍, 준비된 서버에 도구 호출 전달 | OpenAI API 사용료 없음 |
 | **GPT-5.4 Mini** (`gpt-5.4-mini`) | OpenAI Responses API | 빠르고 경제적인 상용 모델, 복합 인코딩 추론 | 입력 \$0.75 / 캐시 \$0.075 / 출력 \$4.50 (M당) |
 | **GPT-5.4** (`gpt-5.4`) | OpenAI Responses API | 심층 추론 및 높은 분석력 | 입력 \$2.50 / 캐시 \$0.25 / 출력 \$15.00 (M당) |
 

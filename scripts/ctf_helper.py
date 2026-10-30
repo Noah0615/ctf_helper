@@ -28,6 +28,7 @@ import zipfile
 
 from ctf_metrics import CTFMetrics, probe_ollama_metadata, probe_gpu_info
 from ctf_ollama_runtime import OllamaRuntime, repair_json_argument
+from ctf_airllm import AIRLLM_MODEL, chat as airllm_chat, check_model as check_airllm_model
 from ctf_verifier import VerificationState, DECOY_KEYWORDS, FRAGMENT_KEYWORDS, is_decoy_flag_value, classify_flag, ObjectiveVerifier
 from ctf_agent_state import Hypothesis, SessionState
 from ctf_agent_controller import AgentController
@@ -215,7 +216,18 @@ def ollama_request(path: str, payload: dict | None = None, timeout: int = 30) ->
         raise RuntimeError(f"Ollama 연결 실패 ({OLLAMA}): {exc}. Ollama를 설치하고 실행하세요.") from exc
 
 
+def local_model_request(path: str, payload: dict, timeout: int = 180) -> dict:
+    if payload.get("model") == AIRLLM_MODEL:
+        if path != "/api/chat":
+            raise ValueError("AirLLM은 chat 요청만 지원합니다.")
+        return airllm_chat(payload)
+    return ollama_request(path, payload, timeout=timeout)
+
+
 def check_model(model: str) -> None:
+    if model == AIRLLM_MODEL:
+        check_airllm_model()
+        return
     tags = ollama_request("/api/tags", timeout=5).get("models", [])
     if model not in {item.get("name") for item in tags}:
         raise RuntimeError(f"Ollama에 {model} 모델이 없습니다. ollama pull {model}을 실행하세요. 사용 가능: " +
@@ -1520,7 +1532,7 @@ class Case:
             )
         }]
         try:
-            summary_res = ollama_request("/api/chat", {
+            summary_res = local_model_request("/api/chat", {
                 "model": model,
                 "messages": compact_request,
                 "stream": False,
@@ -1556,20 +1568,23 @@ class Case:
 
     def solve(self, model: str = DEFAULT_MODEL, max_steps: int | None = None,
               think_mode: str | None = None) -> dict:
+        if hasattr(self, "metrics"):
+            self.metrics.model_name = model
         if model in OPENAI_MODELS:
             step_limit = 15
             effective_steps = 8 if max_steps is None else max_steps
         else:
             step_limit = 50
-            effective_steps = 25 if max_steps is None else max_steps
+            effective_steps = (8 if model == AIRLLM_MODEL else 25) if max_steps is None else max_steps
         if not 1 <= effective_steps <= step_limit:
             raise ValueError(f"최대 단계 수는 1~{step_limit}입니다.")
         self.read_service()
         if model in OPENAI_MODELS:
             from ctf_openai import solve_openai
             return solve_openai(self, model, effective_steps)
-        self.event("Ollama 모델 확인 중")
+        self.event("AirLLM Qwen3-14B 확인 중 · 레이어 스트리밍은 단계마다 오래 걸릴 수 있습니다" if model == AIRLLM_MODEL else "Ollama 모델 확인 중")
         check_model(model)
+        airllm_context = check_airllm_model().get("context", 8192) if model == AIRLLM_MODEL else 16384
         preview = []
         for p in self.iter_files():
             with p.open("rb") as source:
@@ -1653,7 +1668,7 @@ class Case:
         needs_compaction = False
         for turn in range(effective_steps):
             current_chars = sum(len(str(m.get("content") or "")) for m in messages)
-            if current_chars >= 26000 or needs_compaction:
+            if current_chars >= (min(26000, airllm_context) if model == AIRLLM_MODEL else 26000) or needs_compaction:
                 self.event("정보량 한도 근접: 중요 단서만 추출하고 컨텍스트 초기화(압축) 중")
                 messages = self._compact_messages(model, system_content, messages)
                 transcript.append({"compaction": True, "turn": turn + 1})
@@ -1664,7 +1679,7 @@ class Case:
             self.event(f"모델 분석 {turn+1}/{effective_steps}")
 
             start_t = time.monotonic()
-            response = ollama_request("/api/chat", {
+            response = local_model_request("/api/chat", {
                 "model": model, "messages": messages,
                 "tools": active_tools, "stream": False, "think": think_flag,
                 "options": model_options
@@ -1764,7 +1779,7 @@ class Case:
         if not answer:
             self.event("마지막 요약 생성 중")
             messages.append({"role": "user", "content": "도구 사용을 종료하고 지금까지의 근거만으로 최종 결과를 한국어로 요약하세요. 확인되지 않은 flag는 추측이라고 표시하세요."})
-            final = ollama_request("/api/chat", {"model": model, "messages": messages,
+            final = local_model_request("/api/chat", {"model": model, "messages": messages,
                 "stream": False, "think": False,
                 "options": {"temperature": 0, "num_ctx": 16384, "num_predict": 2048}}, timeout=180)
             answer = final.get("message", {}).get("content", "")
@@ -1781,10 +1796,10 @@ def main() -> None:
     solve.add_argument("--problem-file", type=Path, help="문제 설명 텍스트 파일")
     solve.add_argument("--file", type=Path, action="append", default=[], help="첨부 파일 (반복 가능)")
     solve.add_argument("--model", default=DEFAULT_MODEL,
-                       help=f"분석 모델 ({DEFAULT_MODEL}, {', '.join(OPENAI_MODELS)})")
+                       help=f"분석 모델 ({DEFAULT_MODEL}, {AIRLLM_MODEL}, {', '.join(OPENAI_MODELS)})")
     solve.add_argument("--flag-regex", default=DEFAULT_FLAG_REGEX)
     solve.add_argument("--max-steps", type=int, default=None,
-                       help="최대 분석 단계 수 (기본값: 로컬 모델 25, OpenAI 8; 최대 50)")
+                       help="최대 분석 단계 수 (기본값: Ollama 25, AirLLM/OpenAI 8; 최대 50)")
     solve.add_argument("--docker-python", action="store_true")
     solve.add_argument("--tcp-endpoint", help="선택: 문제 서버 host:port에서 배너 한 번 읽기")
     solve.add_argument("--category", choices=CHALLENGE_CATEGORIES, default="auto", help="CTF 분야")

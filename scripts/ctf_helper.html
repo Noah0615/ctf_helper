@@ -56,11 +56,13 @@
 </head>
 <body>
   <h1>CTF 풀이 도우미</h1>
-  <p class="sub">로컬 Qwen3 8B / OpenAI Responses API · 상태 기반 자율 분석 &amp; 목표 검증 (v2.0)</p>
+  <p class="sub">Ollama Qwen3 8B / AirLLM Qwen3 14B / OpenAI Responses API · 상태 기반 분석</p>
   <div class="top-bar" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem; margin:0.8rem 0;">
     <div class="health-bar" style="margin:0;">
       <span id="health-ollama" class="health-pill">Ollama 확인 중…</span>
+      <span id="health-airllm" class="health-pill">AirLLM 확인 중…</span>
       <span id="health-openai" class="health-pill">OpenAI 확인 중…</span>
+      <button type="button" id="refresh-models-btn">모델 상태 새로고침</button>
     </div>
     <div style="min-width:240px;">
       <select id="history-select" style="padding:0.35rem 0.6rem; font-size:0.85rem; background:#182332; border:1px solid #334862;">
@@ -74,16 +76,18 @@
       <option value="lab-qwen3-8b-16k:locked">로컬 Qwen3 8B (무료 · 로컬 오프라인)</option>
       <option value="gpt-5.4-mini">OpenAI GPT-5.4 Mini (빠르고 경제적 · Responses API)</option>
       <option value="gpt-5.4">OpenAI GPT-5.4 (심층 추론 · Responses API)</option>
+      <option value="airllm:qwen3-14b" disabled>AirLLM Qwen3-14B (로컬 · 준비 확인 중)</option>
     </select>
     <p class="note">GPT 모델 선택 시 문제 설명과 파일 내용이 OpenAI API로 전송됩니다. 표시 금액은 도구 한도이며 OpenAI 계정 잔액은 아닙니다.</p>
+    <p class="note">AirLLM은 별도 로컬 서버가 필요합니다. 첫 실행은 약 30GB 모델 다운로드와 레이어 변환을 수행하며 생성은 매우 느릴 수 있습니다. 모델을 로드한 뒤 상태를 새로고침하세요. <a href="/airllm-guide" target="_blank" rel="noopener">AirLLM 설치·실행 안내</a></p>
 
     <div id="think-mode-container" style="margin-top: 0.8rem;">
-      <label for="think-mode">로컬 Qwen3 8B 추론 모드 (사고 및 탐색 전략)</label>
+      <label for="think-mode">로컬 Qwen3 추론 모드</label>
       <select id="think-mode">
-        <option value="quick">빠른 분석 (Quick · think=off, temperature=0, 빠른 도구 탐색)</option>
-        <option value="deep">심층 추론 (Deep · think=on, temperature=0.6, 체계적 가설 검증)</option>
+        <option value="quick">빠른 분석 (Quick · 내부 추론 끔, 도구 탐색)</option>
+        <option value="deep">심층 추론 (Deep · 내부 추론 켬, 체계적 가설 검증)</option>
       </select>
-      <p class="note">심층 추론 모드는 Qwen3 8B의 내부 사고 모드를 켜서 복잡한 실패 원인 및 역공학 가설을 깊게 추론합니다.</p>
+      <p class="note">심층 추론은 생성 시간이 늘어납니다. AirLLM은 먼저 Quick 모드로 확인하고, 추론이 출력 한도 안에 끝나지 않으면 서버의 출력 길이를 늘리세요.</p>
     </div>
 
     <label for="category">CTF 분야</label>

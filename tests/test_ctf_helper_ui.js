@@ -15,6 +15,7 @@ class Element {
     this.options = [];
     this.listeners = {};
     this.classList = {add() {}, remove() {}};
+    this.style = {};
   }
   addEventListener(name, handler) { this.listeners[name] = handler; }
   replaceChildren(...children) {
@@ -37,6 +38,7 @@ get('model').options = [
   Object.assign(new Element(), {value: 'lab-qwen3-8b-16k:locked'}),
   Object.assign(new Element(), {value: 'gpt-5.4-mini'}),
   Object.assign(new Element(), {value: 'gpt-5.4'}),
+  Object.assign(new Element(), {value: 'airllm:qwen3-14b', disabled: true}),
 ];
 get('model').value = 'lab-qwen3-8b-16k:locked';
 
@@ -53,6 +55,7 @@ const fetch = async (url, options = {}) => {
   if (url === '/api/health') return {ok: true, json: async () => ({
     ollama: {model: 'lab-qwen3-8b-16k:locked', ready: false},
     openai: {ready: true, remaining: 29, limit: 30},
+    airllm: {ready: true, state: 'ready', model: 'airllm:qwen3-14b'},
   })};
   if (url === '/api/history') return {ok: true, json: async () => [
     {id: newRun, time: '20261030_000001', model: 'gpt-5.4', flags: [], preview: 'continued'},
@@ -100,6 +103,8 @@ const fireTimer = async () => {
   timers.delete(id);
   callback();
   await flush();
+  assert.equal(get('model').options.find(option => option.value === 'airllm:qwen3-14b').disabled, false);
+  assert.match(get('health-airllm').textContent, /준비됨/);
 };
 
 (async () => {

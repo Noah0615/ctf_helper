@@ -11,6 +11,7 @@ import webbrowser
 
 from ctf_helper import Case, RESULTS, DEFAULT_FLAG_REGEX, DEFAULT_MODEL, OPENAI_MODELS, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, check_model
 from ctf_openai import key_present, get_budget_summary
+from ctf_airllm import AIRLLM_MODEL, health as airllm_health, check_model as check_airllm_model
 
 HOST, PORT = "127.0.0.1", 8765
 PAGE = Path(__file__).with_name("ctf_helper.html").read_bytes()
@@ -44,6 +45,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(200, Path(__file__).with_name("ctf_helper.html").read_bytes(), "text/html")
         if self.path == "/app.js":
             return self._reply(200, Path(__file__).with_name("ctf_helper.js").read_bytes(), "text/javascript")
+        if self.path == "/airllm-guide":
+            return self._reply(200, Path(__file__).resolve().parents[1].joinpath("AIRLLM_GUIDE.md").read_bytes(), "text/plain")
         if self.path == "/api/health":
             ollama_ready = True
             ollama_error = None
@@ -54,11 +57,13 @@ class Handler(BaseHTTPRequestHandler):
                 ollama_error = str(exc)
 
             has_key = key_present()
+            airllm = airllm_health()
             budget = get_budget_summary() if has_key else {
                 "total_spent_usd": 0.0, "total_limit_usd": 30.0, "run_limit_usd": 2.0, "remaining_usd": 30.0
             }
             return self._reply(200, {
-                "ready": ollama_ready or has_key,
+                "ready": ollama_ready or has_key or airllm.get("ready", False),
+                "airllm": airllm,
                 "ollama": {
                     "ready": ollama_ready,
                     "model": DEFAULT_MODEL,
@@ -158,8 +163,12 @@ class Handler(BaseHTTPRequestHandler):
 
             model = str(body.get("model") or DEFAULT_MODEL)
             think_mode = str(body.get("think_mode") or "quick")
-            if model != DEFAULT_MODEL and model not in OPENAI_MODELS:
+            if model != DEFAULT_MODEL and model != AIRLLM_MODEL and model not in OPENAI_MODELS:
                 raise ValueError(f"지원되지 않는 모델입니다: {model}")
+            if think_mode not in {"quick", "deep"}:
+                raise ValueError("지원되지 않는 추론 모드입니다.")
+            if model == AIRLLM_MODEL:
+                check_airllm_model()
             if self.path == "/api/continue":
                 case = Case.from_run(str(body["run_id"]), str(body["note"]))
             else:
@@ -188,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
                             profile=str(body.get("profile") or "general"),
                             track=str(body.get("track") or "auto"),
                             challenge_mode=str(body.get("challenge_mode") or "ctf"))
-        except (ValueError, KeyError, TypeError, binascii.Error, json.JSONDecodeError) as exc:
+        except (ValueError, KeyError, TypeError, RuntimeError, binascii.Error, json.JSONDecodeError) as exc:
             return self._reply(400, {"error": str(exc)})
         job = {"status": "queued", "events": [], "result": None, "error": None, "case": case}
         with LOCK:

@@ -1,0 +1,4 @@
+# Optional worker only; install CUDA PyTorch separately in an isolated venv.
+airllm==4.0.0
+transformers>=4.51,<5
+hf_xet>=1.1,<2
