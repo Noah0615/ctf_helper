@@ -12,16 +12,228 @@ import struct
 # 1. Cryptography: Parameter Extraction and Attack Analysis
 # =====================================================================
 
-def extract_crypto_params(content: str) -> str:
+def solve_lfsr_stream(content: str, files_dir: Path | None = None) -> str | None:
+    """
+    Automatically detects LFSR taps and ciphertext from content and/or challenge files,
+    recovers internal state and seed via known-plaintext prefix attack (DH{, FLAG{, etc.),
+    and decrypts the flag with a self-contained zero-dependency Python script.
+    """
+    combined_texts = [content]
+    if files_dir and Path(files_dir).is_dir():
+        for f in Path(files_dir).iterdir():
+            if f.is_file() and f.suffix in ('.py', '.txt', '.log'):
+                try:
+                    combined_texts.append(f.read_text(encoding='utf-8', errors='replace'))
+                except Exception:
+                    pass
+    all_text = "\n".join(combined_texts)
+
+    # 1. Extract taps
+    taps_list = []
+    # Match patterns like: taps = (32, 22, 2, 1) or taps = [32, 22, 2, 1]
+    for m in re.finditer(r"(?:taps|poly|polynomial)\s*[:=]\s*[\(\[]([0-9,\s]+)[\)\]]", all_text, re.IGNORECASE):
+        raw = m.group(1)
+        nums = [int(x.strip()) for x in raw.split(",") if x.strip().isdigit()]
+        if nums and tuple(nums) not in taps_list:
+            taps_list.append(tuple(nums))
+
+    # Match polynomial notation like: x^32 + x^22 + x^2 + x^1 + 1
+    poly_matches = re.findall(r"x\^?(\d+)", all_text)
+    if poly_matches:
+        poly_nums = sorted(list(set(int(x) for x in poly_matches)), reverse=True)
+        if len(poly_nums) >= 2 and tuple(poly_nums) not in taps_list:
+            taps_list.append(tuple(poly_nums))
+
+    if not taps_list:
+        return None
+
+    # 2. Extract ciphertext hex candidates
+    hex_candidates = re.findall(r"(?:c|ciphertext|enc|output|flag)?\s*[:=>]\s*([0-9a-fA-F]{32,})", all_text, re.IGNORECASE)
+    all_hex = re.findall(r"\b[0-9a-fA-F]{32,}\b", all_text)
+    candidate_ciphers = list(dict.fromkeys(hex_candidates + all_hex))
+
+    if not candidate_ciphers:
+        return None
+
+    known_prefixes = [b"DH{", b"FLAG{", b"CTF{", b"ACDC{", b"APS{", b"picoCTF{", b"null{", b"flag{", b"dh{"]
+
+    for taps in taps_list:
+        size = max(taps)
+        if size > 64:
+            continue
+        for hc in candidate_ciphers:
+            if len(hc) % 2 != 0:
+                hc = hc[:-1]
+            try:
+                ct = bytes.fromhex(hc)
+            except Exception:
+                continue
+            if len(ct) < 8:
+                continue
+
+            for prefix in known_prefixes:
+                if len(prefix) >= 4 or (size <= 32 and len(prefix) >= 3):
+                    guess_range = range(256) if len(prefix) == 3 else [None]
+                    for guess in guess_range:
+                        if guess is not None:
+                            known_pt = prefix + bytes([guess])
+                        else:
+                            known_pt = prefix[:4]
+
+                        ks_known = bytes([ct[i] ^ known_pt[i] for i in range(len(known_pt))])
+                        bits_32 = ''.join(bin(b)[2:].zfill(8) for b in ks_known[:4])
+
+                        # --- Try Model 1: shift returns new_bit (STREAM cipher variant) ---
+                        state_m1 = bits_32[::-1]
+                        pt_m1 = bytearray(known_pt)
+                        valid_m1 = True
+                        for byte_idx in range(len(known_pt), len(ct)):
+                            b_bits = ''
+                            for _ in range(8):
+                                nb = 0
+                                for t in taps:
+                                    nb ^= int(state_m1[t - 1])
+                                nb_str = str(nb)
+                                state_m1 = nb_str + state_m1[:-1]
+                                b_bits += nb_str
+                            kb = int(b_bits, 2)
+                            p_byte = ct[byte_idx] ^ kb
+                            if not (32 <= p_byte <= 126 or p_byte in (10, 13)):
+                                valid_m1 = False
+                                break
+                            pt_m1.append(p_byte)
+
+                        if valid_m1 and pt_m1.endswith(b'}'):
+                            flag = pt_m1.decode('ascii', errors='replace')
+                            rev_state = bits_32[::-1]
+                            for _ in range(size):
+                                nb = int(rev_state[0])
+                                other_xor = 0
+                                for t in taps:
+                                    if t < size:
+                                        other_xor ^= int(rev_state[t])
+                                lost_bit = nb ^ other_xor
+                                rev_state = rev_state[1:] + str(lost_bit)
+                            seed = int(rev_state, 2)
+                            return (
+                                f"[LFSR 스트림 암호 (Stream Cipher) 자동 복호화 성공!]\n"
+                                f"- 감지된 LFSR 탭 (Taps): {taps}, 레지스터 크기: {size} bits\n"
+                                f"- 역추적된 초기 시드 (Seed): {seed} (0x{seed:08x})\n"
+                                f"- 복호화된 Flag: {flag}\n\n"
+                                f"[공격 및 복호화 원리]:\n"
+                                f"1. 플래그 접두사 '{prefix.decode()}'와 전수조사를 결합하여 초기 32비트 키스트림을 복구했습니다.\n"
+                                f"2. LFSR 상태 전이 역산을 통해 32비트 내부 상태 및 시드를 완전히 복구했습니다.\n\n"
+                                f"[즉시 실행 가능한 복호화 스크립트 (run_python용)]:\n"
+                                f"```python\n"
+                                f"# Pure Python LFSR Decryptor (No external libraries required)\n"
+                                f"ct = bytes.fromhex('{hc}')\n"
+                                f"seed = {seed}\n"
+                                f"size = {size}\n"
+                                f"taps = {taps}\n"
+                                f"\n"
+                                f"state = bin(seed)[2:].zfill(size)\n"
+                                f"def shift():\n"
+                                f"    global state\n"
+                                f"    nb = 0\n"
+                                f"    for t in taps:\n"
+                                f"        nb ^= int(state[t - 1])\n"
+                                f"    state = str(nb) + state[:-1]\n"
+                                f"    return str(nb)\n"
+                                f"\n"
+                                f"pt = bytearray()\n"
+                                f"for c in ct:\n"
+                                f"    kb = int(''.join(shift() for _ in range(8)), 2)\n"
+                                f"    pt.append(c ^ kb)\n"
+                                f"print('Decrypted Flag:', pt.decode('ascii'))\n"
+                                f"```"
+                            )
+
+                        # --- Try Model 2: shift returns state[-1] (Standard Fibonacci LFSR) ---
+                        seed_m2 = int(bits_32, 2)
+                        state_m2 = list(bits_32)
+                        pt_m2 = bytearray(known_pt)
+                        valid_m2 = True
+                        for byte_idx in range(len(known_pt), len(ct)):
+                            b_bits = []
+                            for _ in range(8):
+                                nb = 0
+                                for t in taps:
+                                    nb ^= int(state_m2[t - 1])
+                                state_m2 = [str(nb)] + state_m2[:-1]
+                                b_bits.append(int(state_m2[-1]))
+                            kb = int(''.join(map(str, b_bits)), 2)
+                            p_byte = ct[byte_idx] ^ kb
+                            if not (32 <= p_byte <= 126 or p_byte in (10, 13)):
+                                valid_m2 = False
+                                break
+                            pt_m2.append(p_byte)
+
+                        if valid_m2 and pt_m2.endswith(b'}'):
+                            flag = pt_m2.decode('ascii', errors='replace')
+                            return (
+                                f"[표준 Fibonacci LFSR 스트림 암호 자동 복호화 성공!]\n"
+                                f"- 감지된 LFSR 탭 (Taps): {taps}, 레지스터 크기: {size} bits\n"
+                                f"- 복구된 초기 시드 (Seed): {seed_m2} (0x{seed_m2:08x})\n"
+                                f"- 복호화된 Flag: {flag}\n\n"
+                                f"[공격 및 복호화 원리]:\n"
+                                f"1. 표준 Fibonacci LFSR은 초기 32비트 출력이 레지스터 내부 초기 시드와 일치합니다.\n"
+                                f"2. 알려진 플래그 접두사 '{prefix.decode()}'로부터 32비트 키스트림과 초기 시드를 즉시 도출했습니다.\n\n"
+                                f"[즉시 실행 가능한 복호화 스크립트 (run_python용)]:\n"
+                                f"```python\n"
+                                f"# Pure Python Standard LFSR Decryptor\n"
+                                f"ct = bytes.fromhex('{hc}')\n"
+                                f"seed = {seed_m2}\n"
+                                f"size = {size}\n"
+                                f"taps = {taps}\n"
+                                f"\n"
+                                f"state = list(bin(seed)[2:].zfill(size))\n"
+                                f"def clock():\n"
+                                f"    global state\n"
+                                f"    nb = 0\n"
+                                f"    for t in taps:\n"
+                                f"        nb ^= int(state[t - 1])\n"
+                                f"    state = [str(nb)] + state[:-1]\n"
+                                f"    return int(state[-1])\n"
+                                f"\n"
+                                f"pt = bytearray()\n"
+                                f"for c in ct:\n"
+                                f"    kb = int(''.join(str(clock()) for _ in range(8)), 2)\n"
+                                f"    pt.append(c ^ kb)\n"
+                                f"print('Decrypted Flag:', pt.decode('ascii'))\n"
+                                f"```"
+                            )
+
+    return None
+
+
+def extract_crypto_params(content: str, files_dir: Path | None = None) -> str:
     """
     Extracts common crypto parameters (RSA n, e, c, p, q, d, etc.) from text,
-    detects Byte-Caesar/1-byte shift and XOR ciphers on hex ciphertext,
+    detects LFSR stream ciphers, Byte-Caesar/1-byte shift, and XOR ciphers,
     diagnoses vulnerabilities, and outputs ready-to-execute Python templates.
     """
+    # 0. Try LFSR Stream Cipher recovery
+    lfsr_res = solve_lfsr_stream(content, files_dir=files_dir)
+    if lfsr_res:
+        return lfsr_res
+
+    # Prepare combined text if files_dir provided
+    combined_content = content
+    if files_dir and Path(files_dir).is_dir():
+        extra_texts = []
+        for f in Path(files_dir).iterdir():
+            if f.is_file() and f.suffix in ('.py', '.txt', '.log'):
+                try:
+                    extra_texts.append(f.read_text(encoding='utf-8', errors='replace'))
+                except Exception:
+                    pass
+        if extra_texts:
+            combined_content = content + "\n" + "\n".join(extra_texts)
+
     FLAG_PATTERN = re.compile(r"(?:ACDC|FLAG|CTF|DH|APS)\{[^}\r\n]{3,120}\}", re.IGNORECASE)
 
     # 1. Byte-Caesar / 1-byte shift and XOR cipher detection on hex strings
-    hex_candidates = re.findall(r"[0-9a-fA-F]{16,}", content)
+    hex_candidates = re.findall(r"[0-9a-fA-F]{16,}", combined_content)
     for hc in hex_candidates:
         if len(hc) % 2 != 0:
             hc = hc[:-1]
@@ -91,7 +303,7 @@ def extract_crypto_params(content: str) -> str:
     ]
 
     for pat, name in patterns:
-        m = re.search(pat, content)
+        m = re.search(pat, combined_content)
         if m:
             val_str = m.group(1)
             val = int(val_str, 16) if val_str.startswith("0x") or val_str.startswith("0X") else int(val_str)

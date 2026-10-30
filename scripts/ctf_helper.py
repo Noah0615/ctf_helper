@@ -278,7 +278,7 @@ TOOLS = [
                 {"name": {"type": "string"}, "max_gadgets": {"type": "integer"}}, ["name"]),
     tool_schema("find_string_xrefs", "Find cross-references (xrefs) to a string inside an ELF binary to locate which function uses it",
                 {"name": {"type": "string"}, "term": {"type": "string"}}, ["name", "term"]),
-    tool_schema("extract_crypto_params", "Extract RSA/crypto parameters (n, e, c, p, q) from text or an uploaded file, identify vulnerability, and generate attack script",
+    tool_schema("extract_crypto_params", "Extract RSA/crypto parameters (n, e, c, p, q) or solve LFSR/stream ciphers, Byte-Caesar, and XOR from text or uploaded files",
                 {"text": {"type": "string"}, "file_name": {"type": "string"}}, []),
     tool_schema("carve_file_signatures", "Scan an uploaded file for embedded headers (PNG, ZIP, ELF, 7z) and hidden overlay data / steganography",
                 {"name": {"type": "string"}}, ["name"]),
@@ -915,11 +915,30 @@ class Case:
             return "Docker 명령을 찾을 수 없습니다. Python 실행 없이 파일 분석을 계속하세요."
         mount = f"type=bind,src={self.files_dir.resolve()},dst=/challenge,readonly"
         container_name = "ctf-helper-" + uuid.uuid4().hex[:12]
+        crypto_shim = (
+            "import sys, types, math\n"
+            "try:\n"
+            "    import Crypto\n"
+            "except ImportError:\n"
+            "    m_c = types.ModuleType('Crypto')\n"
+            "    m_u = types.ModuleType('Crypto.Util')\n"
+            "    m_n = types.ModuleType('Crypto.Util.number')\n"
+            "    m_n.long_to_bytes = lambda n, s=None: n.to_bytes((n.bit_length() + 7) // 8 or 1, 'big') if s is None else n.to_bytes(s, 'big')\n"
+            "    m_n.bytes_to_long = lambda b: int.from_bytes(b, 'big')\n"
+            "    m_n.inverse = lambda a, m: pow(a, -1, m)\n"
+            "    m_n.GCD = lambda a, b: math.gcd(a, b)\n"
+            "    m_n.isPrime = lambda n: False\n"
+            "    m_u.number = m_n\n"
+            "    m_c.Util = m_u\n"
+            "    sys.modules['Crypto'] = m_c\n"
+            "    sys.modules['Crypto.Util'] = m_u\n"
+            "    sys.modules['Crypto.Util.number'] = m_n\n"
+        )
         command = ["docker", "run", "--rm", "--name", container_name,
                    "--pull=never", "--network=none", "--read-only",
                    "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=64",
                    "--memory=512m", "--cpus=1", "--user=65534:65534", "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
-                   "--mount", mount, "--workdir=/challenge", "python:3.11-alpine", "python", "-c", code]
+                   "--mount", mount, "--workdir=/challenge", "python:3.11-alpine", "python", "-c", crypto_shim + code]
         try:
             proc = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                                   errors="replace", timeout=20)
@@ -1020,7 +1039,7 @@ class Case:
                     content = self._file(str(args["file_name"])).read_text(encoding="utf-8", errors="replace")
                 elif "text" in args:
                     content = str(args["text"])
-                res = extract_crypto_params(content)
+                res = extract_crypto_params(content, files_dir=self.files_dir)
                 self._record_flags(res, "?? ???? / ??? ??")
                 result = res
             elif name == "carve_file_signatures":
@@ -1544,7 +1563,7 @@ class Case:
             "In your final answer, give a concise Korean explanation, exact candidate flag(s) if found, "
             "and distinguish observed input, sandbox-derived, and unverified guesses. "
             "For pwn/reversing use inspect_elf, disassemble_function, and targeted binary strings to confirm control flow; never execute supplied native binaries. "
-            "For forensics use analyze_binary, inspect_archive, and read_archive_entry. For crypto, use decode_text, extract_crypto_params, and offline Python calculations. For AI security (ai-security), use inspect_ai_model to check SafeTensors/GGUF metadata and PyTorch/pickle bytecode for hidden flags or RCE; use craft_prompt_injections for LLM jailbreak and system prompt extraction; use craft_pickle_exploit for torch.load / pickle.loads targets. "
+            "For forensics use analyze_binary, inspect_archive, and read_archive_entry. For crypto, use decode_text, extract_crypto_params (which breaks LFSR stream ciphers, Byte-Caesar, and XOR), and offline Python calculations. For AI security (ai-security), use inspect_ai_model to check SafeTensors/GGUF metadata and PyTorch/pickle bytecode for hidden flags or RCE; use craft_prompt_injections for LLM jailbreak and system prompt extraction; use craft_pickle_exploit for torch.load / pickle.loads targets. "
             "If /flag exists only on the remote server and its output is unavailable, state that the exact flag is unknown. "
             "Use HTTP tools only for the explicitly supplied CTF web origin. For a source-proven finite prefix or integer oracle, "
             "call http_prefix_oracle or http_integer_oracle to complete the search and inspect the actual response; do not stop at a sample script. "

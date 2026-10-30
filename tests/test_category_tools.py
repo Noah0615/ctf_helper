@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 import sys
 from pathlib import Path
 import tempfile
@@ -128,6 +128,79 @@ class TestCategoryTools(unittest.TestCase):
         # 3. find_string_xrefs
         xref_res = case.call_tool('find_string_xrefs', {'name': 'chall', 'term': 'puts'})
         self.assertIn('puts', xref_res)
+
+
+
+    def test_extract_crypto_params_lfsr_stream(self):
+        flag = b'DH{synthetic_lfsr_stream_test_32}'
+        size = 32
+        taps = (32, 22, 2, 1)
+        seed = 0x12345678
+        state = bin(seed)[2:].zfill(size)
+        def shift():
+            nonlocal state
+            nb = 0
+            for t in taps:
+                nb ^= int(state[t - 1])
+            state = str(nb) + state[:-1]
+            return str(nb)
+
+        ct = bytes([b ^ int(''.join(shift() for _ in range(8)), 2) for b in flag])
+        text = f'taps = (32, 22, 2, 1)\nencrypted = {ct.hex()}'
+        res = extract_crypto_params(text)
+        self.assertIn('LFSR 스트림 암호', res)
+        self.assertIn(flag.decode(), res)
+
+    def test_extract_crypto_params_lfsr_fibonacci(self):
+        flag = b'FLAG{fibonacci_lfsr_synthetic_123}'
+        size = 32
+        taps = (32, 22, 2, 1)
+        seed = 0xa5b4c3d2
+        state = list(bin(seed)[2:].zfill(size))
+        def clock():
+            nonlocal state
+            nb = 0
+            for t in taps:
+                nb ^= int(state[t - 1])
+            state = [str(nb)] + state[:-1]
+            return int(state[-1])
+
+        ct = bytes([b ^ int(''.join(str(clock()) for _ in range(8)), 2) for b in flag])
+        text = f'taps = (32, 22, 2, 1)\noutput = {ct.hex()}'
+        res = extract_crypto_params(text)
+        self.assertIn('LFSR', res)
+        self.assertIn(flag.decode(), res)
+
+    def test_extract_crypto_params_lfsr_via_case_files_dir(self):
+        flag = b'DH{case_files_dir_lfsr_solved_ok}'
+        size = 32
+        taps = (32, 22, 2, 1)
+        seed = 0xabcdef12
+        state = bin(seed)[2:].zfill(size)
+        def shift():
+            nonlocal state
+            nb = 0
+            for t in taps:
+                nb ^= int(state[t - 1])
+            state = str(nb) + state[:-1]
+            return str(nb)
+
+        ct = bytes([b ^ int(''.join(shift() for _ in range(8)), 2) for b in flag])
+        case = helper.Case('LFSR test', [
+            ('cipher.py', b'class STREAM:\n    def __init__(self):\n        self.taps = (32, 22, 2, 1)\n'),
+            ('output.txt', f'encrypted flag > {ct.hex()}\n'.encode())
+        ])
+        res = case.call_tool('extract_crypto_params', {})
+        self.assertIn(flag.decode(), res)
+        self.assertTrue(any(flag.decode() in item['flag'] for item in case.evidence))
+
+    def test_run_python_crypto_shim(self):
+        case = helper.Case('Crypto run_python test', [], docker_python=True)
+        res = case.run_python('from Crypto.Util.number import long_to_bytes\nprint(long_to_bytes(0x44487b746573747d).decode())')
+        if '격리 이미지가 없습니다' in res or 'Docker 명령을 찾을 수 없습니다' in res:
+            self.skipTest('Docker unavailable or image missing')
+        self.assertIn('exit=0', res)
+        self.assertIn('DH{test}', res)
 
 
 if __name__ == '__main__':
