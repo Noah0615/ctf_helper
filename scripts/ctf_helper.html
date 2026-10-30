@@ -85,6 +85,25 @@
     </select>
     <div id="cat-hint" class="cat-hint">문제 설명과 첨부 파일을 분석하여 최적의 분석 흐름을 자동으로 결정합니다.</div>
 
+    <label for="profile">대회 프로필</label>
+    <select id="profile">
+      <option value="acdc-2026">2026 ACDC</option>
+      <option value="general">일반 CTF</option>
+    </select>
+    <label for="track">ACDC AI 보안 영역</label>
+    <select id="track">
+      <option value="auto">자동 판별</option>
+      <option value="ai-for-security">AI for Security · AI를 활용한 보안</option>
+      <option value="security-for-ai">Security for AI · AI 자체의 안전성</option>
+      <option value="ai-platform-security">AI Platform Security · AI 플랫폼 보안</option>
+    </select>
+    <label for="challenge-mode">문제 방식</label>
+    <select id="challenge-mode">
+      <option value="ctf">CTF · 플래그 찾기</option>
+      <option value="koth">KotH · 상태 및 시도 기록</option>
+    </select>
+    <p class="note">KotH 세부 규칙이 공개되지 않아 현재는 관찰과 분석 기록만 지원합니다.</p>
+
     <label for="description">문제 설명</label>
     <textarea id="description" maxlength="16000" placeholder="문제 제목, 분야, 설명, flag 형식, 문제 서버 주소를 붙여넣으세요. (Ctrl+Enter로 시작 가능)" required></textarea>
 
@@ -125,6 +144,16 @@
     <p id="status"></p>
     <div id="flags"></div>
     <pre id="answer"></pre>
+    <details>
+      <summary>문제 서버 요청 기록</summary>
+      <pre id="request-log"></pre>
+    </details>
+    <div id="continue-panel" hidden>
+      <label for="continue-note">이 문제 이어 분석하기</label>
+      <textarea id="continue-note" maxlength="8000" placeholder="새 서버 응답, 실패한 시도, 추가 단서를 붙여넣으세요."></textarea>
+      <button id="continue-btn" type="button">이어서 분석</button>
+      <p class="note">이전 파일과 분석 근거를 불러와 새 실행 기록으로 이어집니다.</p>
+    </div>
     <details id="events-details" open>
       <summary>분석 단계 및 도구 로그</summary>
       <pre id="events"></pre>

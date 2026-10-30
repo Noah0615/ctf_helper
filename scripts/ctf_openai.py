@@ -13,7 +13,7 @@ try:
 except ImportError:
     OpenAI = None
 
-from ctf_helper import ROOT, TOOLS, is_text, CATEGORY_GUIDANCE
+from ctf_helper import ROOT, TOOLS, is_text
 
 LEDGER_FILE = ROOT / ".runtime" / "ctf-helper" / "openai-usage.sqlite3"
 MODELS = {
@@ -159,8 +159,9 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
             elif data.startswith(b"\x1f\x8b"): magic = "GZIP archive"
             preview.append(f"### {p.name} [{magic}, {len(data)} bytes] (use analyze_binary or inspect_archive)")
     prompt = ("문제 설명:\n" + case.description + "\n\n입력 파일:\n" + case.list_files() +
-              "\n\n텍스트 미리보기:\n" + "\n".join(preview)[:8500])
-    guidance = CATEGORY_GUIDANCE.get(case.category, CATEGORY_GUIDANCE["auto"])
+              "\n\n텍스트 미리보기:\n" + "\n".join(preview)[:8500]
+              + case.continuation_context)
+    guidance = case.analysis_guidance()
     instructions = (
         f"You are a CTF study assistant for category: {case.category}. {guidance} "
         "Analyze only the supplied problem, local files, and explicit CTF endpoint. "
@@ -172,6 +173,7 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
         "For forensics use analyze_binary, inspect_archive, and read_archive_entry; for crypto use decode_text and offline Python calculations. "
         "If a CTF TCP endpoint was explicitly supplied, use tcp_exchange to inspect its menu and test a reasoned input sequence. "
         "Fake_Flag, dummy and decoy strings are known non-answers. Never present placeholders like DH{...} as candidates. "
+        "A flag-shaped string in a file or banner may be a fragment or decoy; verify its role before concluding. "
         "Do not request access beyond the supplied CTF endpoint or any contest platform access."
     )
     inputs: list = [{"role": "user", "content": prompt +
@@ -189,7 +191,7 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
         input_bytes += len(instructions.encode("utf-8")) + len(json.dumps(active_tools).encode("utf-8"))
         for output_limit in (MAX_OUTPUT_TOKENS, RETRY_MAX_OUTPUT_TOKENS):
             case.event(f"OpenAI API 요청 중 (예산 확인, 출력 한도 {output_limit}토큰)")
-            reservation = ledger.reserve(case.id, model, input_bytes, output_limit)
+            reservation = ledger.reserve(case.root_id, model, input_bytes, output_limit)
             try:
                 response = client.responses.create(model=model, instructions=instructions,
                     input=inputs, tools=active_tools,
@@ -216,6 +218,7 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
     forced_tool_next = None
     initial_http_requests = case.http_requests
     initial_tcp_requests = case.tcp_requests
+    no_call_retries = 0
     for turn in range(max_steps):
         case.event(f"GPT 분석 {turn+1}/{max_steps}")
         response = request(True, forced_tool=forced_tool_next)
@@ -225,6 +228,9 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
         transcript.append({"turn": turn+1, "content": response.output_text,
                            "tools": [item.name for item in calls]})
         if not calls:
+            if case.has_derived_candidate():
+                answer = response.output_text or "모델이 답변을 생성하지 못했습니다."
+                break
             if case.tcp_endpoint and case.tcp_requests == initial_tcp_requests and not any(
                     item["source"].startswith("문제 서버:") and item["flag"]
                     for item in case.evidence):
@@ -242,8 +248,15 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
                     "명시된 CTF 원본의 상대 경로만 사용할 수 있습니다.")})
                 forced_tool_next = "http_get"
                 continue
+            if no_call_retries < 1 and turn < max_steps - 1 and case.evidence:
+                no_call_retries += 1
+                inputs.append({"role": "user", "content": (
+                    "관찰된 flag 모양의 문자열이 최종 정답인지 다시 검토하세요. "
+                    "조각·미끼 가능성과 아직 읽지 않은 파일 또는 응답을 확인하고, 필요한 도구를 호출하세요.")})
+                continue
             answer = response.output_text or "모델이 답변을 생성하지 못했습니다."
             break
+        no_call_retries = 0
         for index, item in enumerate(calls):
             try:
                 args = json.loads(item.arguments)

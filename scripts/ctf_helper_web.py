@@ -9,7 +9,7 @@ from pathlib import Path
 import threading
 import webbrowser
 
-from ctf_helper import Case, RESULTS, DEFAULT_FLAG_REGEX, DEFAULT_MODEL, OPENAI_MODELS, CHALLENGE_CATEGORIES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, check_model
+from ctf_helper import Case, RESULTS, DEFAULT_FLAG_REGEX, DEFAULT_MODEL, OPENAI_MODELS, MAX_FILE_BYTES, MAX_TOTAL_BYTES, check_model
 from ctf_openai import key_present, get_budget_summary
 
 HOST, PORT = "127.0.0.1", 8765
@@ -90,6 +90,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "flags": [item["flag"] for item in data.get("flag_candidates", [])],
                                 "preview": prob_text.strip(),
                                 "cost_usd": data.get("cost_usd"),
+                                "parent_id": data.get("parent_id"),
                             })
                         except Exception:
                             continue
@@ -111,37 +112,44 @@ class Handler(BaseHTTPRequestHandler):
         return self._reply(404, {"error": "경로 없음"})
 
     def do_POST(self):
-        if self.path != "/api/solve" or not self._local_request():
+        if self.path not in {"/api/solve", "/api/continue"} or not self._local_request():
             return self._reply(404, {"error": "경로 없음"})
         if self.headers.get("Origin") not in {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}:
             return self._reply(403, {"error": "로컬 화면에서만 제출하세요."})
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 1 <= length <= 17 * 1024 * 1024:
+            max_length = 17 * 1024 * 1024 if self.path == "/api/solve" else 16 * 1024
+            if not 1 <= length <= max_length:
                 raise ValueError("요청 크기가 너무 큽니다.")
             body = json.loads(self.rfile.read(length))
-            encoded = body.get("files", [])
-            if not isinstance(encoded, list) or len(encoded) > 20:
-                raise ValueError("파일은 최대 20개까지 선택하세요.")
-            files = []
-            size = 0
-            for item in encoded:
-                raw = base64.b64decode(item["data"], validate=True)
-                if len(raw) > MAX_FILE_BYTES:
-                    raise ValueError("파일 하나가 8 MiB를 초과했습니다.")
-                size += len(raw)
-                files.append((item["name"], raw))
-            if size > MAX_TOTAL_BYTES:
-                raise ValueError("파일 합계가 12 MiB를 초과했습니다.")
             model = str(body.get("model") or DEFAULT_MODEL)
             if model != DEFAULT_MODEL and model not in OPENAI_MODELS:
                 raise ValueError(f"지원되지 않는 모델입니다: {model}")
-            case = Case(str(body["description"]), files,
-                        str(body.get("flag_regex") or DEFAULT_FLAG_REGEX),
-                        bool(body.get("docker_python", False)),
-                        tcp_endpoint=str(body.get("tcp_endpoint") or ""),
-                        category=str(body.get("category") or "auto"),
-                        allow_mismatch=bool(body.get("allow_mismatch", False)))
+            if self.path == "/api/continue":
+                case = Case.from_run(str(body["run_id"]), str(body["note"]))
+            else:
+                encoded = body.get("files", [])
+                if not isinstance(encoded, list) or len(encoded) > 20:
+                    raise ValueError("파일은 최대 20개까지 선택하세요.")
+                files = []
+                size = 0
+                for item in encoded:
+                    raw = base64.b64decode(item["data"], validate=True)
+                    if len(raw) > MAX_FILE_BYTES:
+                        raise ValueError("파일 하나가 8 MiB를 초과했습니다.")
+                    size += len(raw)
+                    files.append((item["name"], raw))
+                if size > MAX_TOTAL_BYTES:
+                    raise ValueError("파일 합계가 12 MiB를 초과했습니다.")
+                case = Case(str(body["description"]), files,
+                            str(body.get("flag_regex") or DEFAULT_FLAG_REGEX),
+                            bool(body.get("docker_python", False)),
+                            tcp_endpoint=str(body.get("tcp_endpoint") or ""),
+                            category=str(body.get("category") or "auto"),
+                            allow_mismatch=bool(body.get("allow_mismatch", False)),
+                            profile=str(body.get("profile") or "general"),
+                            track=str(body.get("track") or "auto"),
+                            challenge_mode=str(body.get("challenge_mode") or "ctf"))
         except (ValueError, KeyError, TypeError, binascii.Error, json.JSONDecodeError) as exc:
             return self._reply(400, {"error": str(exc)})
         job = {"status": "queued", "events": [], "result": None, "error": None}

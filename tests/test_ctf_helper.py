@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 import zipfile
@@ -121,16 +122,20 @@ class HelperTests(unittest.TestCase):
         case = helper.Case(description, files, allow_mismatch=True)
         self.assertEqual(case.category, "auto")
 
-    def test_explicit_tcp_banner_can_supply_flag_without_model_call(self):
+    def test_tcp_banner_flag_is_observed_but_does_not_skip_analysis(self):
         case = helper.Case("형식 DH{...}", [], tcp_endpoint="ctf.example:1234")
         conn = MagicMock()
         conn.__enter__.return_value.recv.side_effect = [b"FLAG : DH{from_service}\n", b""]
         with patch.object(helper.socket, "create_connection", return_value=conn) as connect, \
-             patch.object(helper, "check_model", side_effect=AssertionError("model should not run")):
-            result = case.solve()
+             patch.object(helper, "ollama_request", side_effect=[
+                 {"models": [{"name": helper.DEFAULT_MODEL}]},
+                 {"message": {"content": "배너의 값은 후보이며 공식 채점은 미확인입니다."}}
+             ]) as model_call:
+            result = case.solve(max_steps=1)
         connect.assert_called_once_with(("ctf.example", 1234), timeout=5)
+        self.assertEqual(model_call.call_count, 2)
         self.assertEqual([item["flag"] for item in result["flag_candidates"]], ["DH{from_service}"])
-        self.assertEqual(result["steps"], [])
+        self.assertEqual(len(result["steps"]), 1)
         self.assertIn("문제 서버 출력", result["flag_candidates"][0]["status"])
         self.assertEqual(result["result_status"], "remote_observed")
         self.assertEqual(result["remote_observed_flags"], ["DH{from_service}"])
@@ -171,11 +176,15 @@ class HelperTests(unittest.TestCase):
         fake_response.read.return_value = b"marker=APS{from_web}"
         with patch.object(helper, "build_opener") as opener:
             opener.return_value.open.return_value.__enter__.return_value = fake_response
-            output = case.http_get("/audit?q=test")
+            output = case.http_get("/audit?q=test", {"X-API-Key": "challenge-token"})
         self.assertIn("APS{from_web}", output)
         self.assertEqual(case.evidence[0]["flag"], "APS{from_web}")
         self.assertIn("문제 웹 응답", case.evidence[0]["source"])
         self.assertIn("직접 확인", case.evidence[0]["status"])
+        self.assertEqual(case.requests[0]["method"], "GET")
+        self.assertEqual(case.requests[0]["path"], "/audit?q=test")
+        self.assertEqual(case.requests[0]["headers"]["X-API-Key"], "<redacted>")
+        self.assertTrue((case.root / "requests.jsonl").is_file())
         self.assertIn("상대 경로", case.http_get("https://elsewhere.example/"))
         with self.assertRaises(ValueError):
             helper.Case("웹 문제", [], tcp_endpoint="http://ctf.example:8000/path")
@@ -439,6 +448,104 @@ class HelperTests(unittest.TestCase):
             result = case.solve(max_steps=5)
         self.assertIn("심층 분석 유도", " ".join(events))
         self.assertEqual(result["flag_candidates"][0]["flag"], "ACDC{deep_dive_success}")
+
+    def test_acdc_profile_classifies_fragments_and_decoys(self):
+        case = helper.Case("ACDC investigation", [
+            ("parts.txt", b"fragment: ACDC{first_part}\ndecoy: ACDC{wrong_value}\n")
+        ], profile="acdc-2026", track="security-for-ai")
+        self.assertIn("security-for-ai", case.analysis_guidance())
+        self.assertEqual([item["role"] for item in case.evidence], ["fragment", "decoy"])
+        result = case.finish(helper.DEFAULT_MODEL, "조각의 변환이 필요합니다.", [])
+        self.assertEqual(result["flag_candidates"], [])
+        self.assertEqual(result["result_status"], "unresolved")
+        self.assertEqual(len(result["flag_observations"]), 2)
+
+    def test_model_repeating_fragment_does_not_turn_it_into_candidate(self):
+        case = helper.Case("ACDC puzzle", [("parts.txt", b"fragment: ACDC{piece_one}")],
+                           profile="acdc-2026")
+        result = case.finish(helper.DEFAULT_MODEL, "ACDC{piece_one}는 아직 조각입니다.", [])
+        self.assertEqual(result["flag_candidates"], [])
+        self.assertEqual(result["flag_observations"][0]["role"], "fragment")
+
+    def test_continuation_restores_files_context_and_profile(self):
+        first = helper.Case("ACDC agent puzzle", [("notes.txt", b"fragment: ACDC{piece_one}")],
+                            profile="acdc-2026", track="ai-platform-security",
+                            tcp_endpoint="http://ctf.example:8080/")
+        first.finish(helper.DEFAULT_MODEL, "첫 번째 조각만 확인", [{"tool": "read_file", "result": "piece_one"}])
+        resumed = helper.Case.from_run(first.id, "두 번째 응답에서 ACDC{piece_two} 조각 발견")
+        self.assertNotEqual(resumed.id, first.id)
+        self.assertEqual(resumed.root_id, first.id)
+        self.assertEqual(resumed.parent_id, first.id)
+        self.assertEqual(resumed.profile, "acdc-2026")
+        self.assertEqual(resumed.track, "ai-platform-security")
+        self.assertEqual(resumed.web_origin, "http://ctf.example:8080")
+        self.assertEqual((resumed.files_dir / "notes.txt").read_bytes(), b"fragment: ACDC{piece_one}")
+        self.assertIn("첫 번째 조각만 확인", resumed.continuation_context)
+        self.assertEqual(len(resumed.evidence), 2)
+        result = resumed.finish(helper.DEFAULT_MODEL, "아직 변환 필요", [])
+        self.assertEqual(result["parent_id"], first.id)
+        self.assertEqual(result["flag_candidates"], [])
+
+    def test_input_flag_does_not_stop_local_model_before_analysis(self):
+        case = helper.Case("ACDC puzzle", [("source.txt", b"ACDC{unverified_input}")])
+        responses = iter([
+            {"message": {"content": "파일의 문자열은 아직 검증되지 않았습니다."}},
+            {"message": {"content": "추가 분석이 필요합니다."}}
+        ])
+        def fake_request(path, payload=None, timeout=30):
+            return {"models": [{"name": helper.DEFAULT_MODEL}]} if path == "/api/tags" else next(responses)
+        with patch.object(helper, "ollama_request", side_effect=fake_request) as model_call:
+            result = case.solve(max_steps=2)
+        self.assertEqual(model_call.call_count, 3)
+        self.assertEqual(len([item for item in result["steps"] if "turn" in item]), 2)
+
+    def test_web_api_can_continue_completed_problem_after_reloading_from_disk(self):
+        import ctf_helper_web as web
+
+        def post(path, payload):
+            raw = json.dumps(payload).encode()
+            handler = web.Handler.__new__(web.Handler)
+            handler.path = path
+            handler.headers = {
+                "Host": f"127.0.0.1:{web.PORT}",
+                "Origin": f"http://127.0.0.1:{web.PORT}",
+                "Content-Length": str(len(raw)),
+            }
+            handler.rfile = io.BytesIO(raw)
+            handler.wfile = io.BytesIO()
+            handler.send_response = MagicMock()
+            handler.send_header = MagicMock()
+            handler.end_headers = MagicMock()
+            handler.do_POST()
+            self.assertEqual(handler.send_response.call_args.args[0], 202)
+            return json.loads(handler.wfile.getvalue())
+
+        def done(job_id):
+            for _ in range(40):
+                with web.LOCK:
+                    job = web.JOBS[job_id].copy()
+                if job["status"] == "done":
+                    return job["result"]
+                if job["status"] == "failed":
+                    self.fail(job["error"])
+                time.sleep(.05)
+            self.fail("analysis job did not finish")
+
+        def fake_ollama(path, payload=None, timeout=30):
+            return {"models": [{"name": helper.DEFAULT_MODEL}]} if path == "/api/tags" else {
+                "message": {"content": "조각을 더 확인해야 합니다."}}
+
+        with patch.object(web, "RESULTS", Path(self.temp.name)), \
+             patch.object(helper, "ollama_request", side_effect=fake_ollama):
+            first_job = post("/api/solve", {"description": "ACDC agent puzzle", "files": [],
+                                               "profile": "acdc-2026", "track": "security-for-ai"})
+            first = done(first_job["job_id"])
+            second_job = post("/api/continue", {"run_id": first["run_id"],
+                                                 "note": "새 단서: fragment ACDC{piece_two}"})
+            second = done(second_job["job_id"])
+            self.assertEqual(second["parent_id"], first["run_id"])
+            self.assertEqual(second["profile"], "acdc-2026")
+            self.assertEqual(second["flag_candidates"], [])
 
     def test_local_model_compaction_resets_messages_with_summary(self):
         case = helper.Case("Compaction test", [])

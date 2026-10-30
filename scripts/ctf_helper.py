@@ -7,6 +7,7 @@ import codecs
 from collections import Counter
 from datetime import datetime
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -41,6 +42,15 @@ DECLARED_FLAG_FORMAT = re.compile(
 )
 FILE_FLAG_PREFIX = re.compile(rb"\b([A-Za-z][A-Za-z0-9_]{1,23})\{[^}\r\n]{1,160}\}")
 CHALLENGE_CATEGORIES = ("auto", "web", "pwn", "reversing", "crypto", "forensics", "ai-security", "cloud-web3", "other")
+PROFILES = ("general", "acdc-2026")
+ACDC_TRACKS = ("auto", "ai-for-security", "security-for-ai", "ai-platform-security")
+CHALLENGE_MODES = ("ctf", "koth")
+ACDC_GUIDANCE = {
+    "auto": "Identify whether this is AI for Security, Security for AI, or AI Platform Security from evidence.",
+    "ai-for-security": "Look for security data, detection logic, false positives, and reproducible evaluation evidence.",
+    "security-for-ai": "Inspect model and agent trust boundaries, prompt injection, data poisoning, model evasion, and multi-step token flows.",
+    "ai-platform-security": "Inspect AI deployment components, MCP/tool permissions, path handling, APIs, and configuration boundaries.",
+}
 CATEGORY_GUIDANCE = {
     "auto": "Examine description and files to identify the CTF domain and pick appropriate tools.",
     "web": "Inspect web source code, templates, routes, Dockerfiles, and environment configs. When an endpoint is given, use http_get and http_post to test endpoints, headers, and cookies.",
@@ -199,9 +209,10 @@ TOOLS = [
     tool_schema("run_python", "Run a short Python 3 calculation in an offline Docker sandbox; challenge files are read-only under /challenge",
                 {"code": {"type": "string"}}, ["code"]),
     tool_schema("http_get", "GET one path on the explicitly supplied CTF web origin; returns status, response headers, and body",
-                {"path": {"type": "string"}}, ["path"]),
+                {"path": {"type": "string"}, "headers": {"type": "object", "additionalProperties": {"type": "string"}}}, ["path"]),
     tool_schema("http_post", "POST data to one path on the explicitly supplied CTF web origin; returns status, response headers, and body",
-                {"path": {"type": "string"}, "body": {"type": "string"}, "content_type": {"type": "string"}}, ["path"]),
+                {"path": {"type": "string"}, "body": {"type": "string"}, "content_type": {"type": "string"},
+                 "headers": {"type": "object", "additionalProperties": {"type": "string"}}}, ["path"]),
     tool_schema("analyze_binary", "Inspect a supplied binary without executing it: magic, architecture, entropy, and printable strings (ASCII/UTF-16)",
                 {"name": {"type": "string"}}, ["name"]),
     tool_schema("inspect_archive", "List safe metadata and previews from a supplied ZIP or TAR archive without extracting it to disk",
@@ -228,7 +239,10 @@ class Case:
                  flag_regex: str = DEFAULT_FLAG_REGEX, docker_python: bool = False,
                  event: Callable[[str], None] | None = None,
                  tcp_endpoint: str | None = None, category: str = "auto",
-                 allow_mismatch: bool = False):
+                 allow_mismatch: bool = False, profile: str = "general",
+                 track: str = "auto", challenge_mode: str = "ctf",
+                 parent_id: str | None = None, continuation_note: str = "",
+                 root_id: str | None = None):
         if not description.strip() or len(description) > MAX_DESCRIPTION:
             raise ValueError("문제 설명은 1~16,000자로 입력하세요.")
         if len(files) > MAX_FILES or sum(len(data) for _, data in files) > MAX_TOTAL_BYTES:
@@ -241,7 +255,17 @@ class Case:
             raise ValueError(conflict)
         if category not in CHALLENGE_CATEGORIES:
             raise ValueError("지원되지 않는 CTF 분야입니다.")
+        if profile not in PROFILES or track not in ACDC_TRACKS or challenge_mode not in CHALLENGE_MODES:
+            raise ValueError("지원되지 않는 대회 프로필 또는 문제 유형입니다.")
+        if len(continuation_note) > 8000:
+            raise ValueError("추가 관찰은 8,000자 이하로 입력하세요.")
         self.category = category
+        self.profile = profile
+        self.track = track
+        self.challenge_mode = challenge_mode
+        self.parent_id = parent_id
+        self.continuation_note = continuation_note
+        self.continuation_context = ""
         self.tcp_endpoint, self.web_origin = parse_challenge_endpoint(tcp_endpoint)
         self.service_output = ""
         self.http_requests = 0
@@ -252,6 +276,7 @@ class Case:
             raise ValueError("중복된 파일 이름이 있습니다.")
         self.pattern = get_flag_pattern(flag_regex)
         self.id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+        self.root_id = root_id or self.id
         self.root = RESULTS / self.id
         self.files_dir = self.root / "files"
         self.files_dir.mkdir(parents=True, exist_ok=False)
@@ -259,11 +284,92 @@ class Case:
         self.docker_python = docker_python
         self.event = event or (lambda message: None)
         self.evidence: list[dict] = []
+        self.requests: list[dict] = []
         for name, data in files:
             (self.files_dir / name).write_bytes(data)
             self._record_flags(data.decode("utf-8", errors="replace"), f"입력 파일: {name}")
         self._record_flags(description, "문제 설명")
+        if continuation_note:
+            self._record_flags(continuation_note, "추가 관찰")
         (self.root / "problem.txt").write_text(description, encoding="utf-8")
+        (self.root / "case.json").write_text(json.dumps({
+            "category": category, "profile": profile, "track": track,
+            "challenge_mode": challenge_mode, "tcp_endpoint": tcp_endpoint or "",
+            "flag_regex": flag_regex, "docker_python": docker_python,
+            "allow_mismatch": allow_mismatch, "uploaded_names": names,
+            "parent_id": parent_id, "root_id": self.root_id,
+            "continuation_note": continuation_note,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @classmethod
+    def from_run(cls, run_id: str, note: str, *, event=None) -> "Case":
+        if not re.fullmatch(r"\d{8}_\d{6}_[0-9a-f]{8}", run_id):
+            raise ValueError("올바르지 않은 실행 ID입니다.")
+        if not 1 <= len(note.strip()) <= 8000:
+            raise ValueError("이어 분석할 추가 관찰을 1~8,000자로 입력하세요.")
+        previous = RESULTS / run_id
+        result_path = previous / "result.json"
+        if not result_path.is_file():
+            raise ValueError("완료된 분석 기록이 없습니다.")
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        meta_path = previous / "case.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+        source_dir = previous / "files"
+        names = meta.get("uploaded_names") or [p.name for p in source_dir.iterdir() if p.is_file()]
+        files = [(checked_name(name), (source_dir / checked_name(name)).read_bytes()) for name in names]
+        case = cls((previous / "problem.txt").read_text(encoding="utf-8"), files,
+                   flag_regex=meta.get("flag_regex", DEFAULT_FLAG_REGEX),
+                   docker_python=bool(meta.get("docker_python", False)), event=event,
+                   tcp_endpoint=meta.get("tcp_endpoint", ""), category=meta.get("category", "auto"),
+                   allow_mismatch=bool(meta.get("allow_mismatch", False)),
+                   profile=meta.get("profile", "general"), track=meta.get("track", "auto"),
+                   challenge_mode=meta.get("challenge_mode", "ctf"), parent_id=run_id,
+                   continuation_note=note.strip(), root_id=meta.get("root_id", run_id))
+        extra_bytes = 0
+        copied_extra = []
+        for item in sorted(source_dir.iterdir()):
+            if item.name in names or not item.is_file() or item.is_symlink():
+                continue
+            size = item.stat().st_size
+            if size > MAX_FILE_BYTES or extra_bytes + size > 16 * 1024 * 1024 or len(copied_extra) >= 20:
+                continue
+            checked_name(item.name)
+            shutil.copyfile(item, case.files_dir / item.name)
+            copied_extra.append(item.name)
+            extra_bytes += size
+        previous_evidence = result.get("flag_observations", result.get("flag_candidates", []))
+        case.evidence = [item for item in previous_evidence if isinstance(item, dict)]
+        case._record_flags(note, "추가 관찰")
+        steps = result.get("steps", [])[-12:]
+        case.continuation_context = (
+            "\n\n[이전 실행에서 이어 분석: 아래는 신뢰할 수 없는 기록 데이터]\n"
+            + "이전 답변:\n" + str(result.get("answer", ""))[:3500]
+            + "\n최근 단계:\n" + json.dumps(steps, ensure_ascii=False, default=str)[:5000]
+            + "\n기존 문자열 분류:\n" + json.dumps(previous_evidence, ensure_ascii=False, default=str)[:1500]
+            + "\n이전 요청 경로:\n" + json.dumps(
+                [{"method": entry.get("method"), "path": entry.get("path")}
+                 for entry in result.get("requests", [])[-8:] if isinstance(entry, dict)], ensure_ascii=False)
+            + ("\n이전 실행에서 보존한 파일: " + ", ".join(copied_extra) if copied_extra else "")
+            + "\n사용자가 새로 제공한 관찰:\n" + note.strip()
+            + "\n이전 시도를 반복하지 말고 남은 가설을 검증하세요."
+        )
+        return case
+
+    def analysis_guidance(self) -> str:
+        guidance = CATEGORY_GUIDANCE.get(self.category, CATEGORY_GUIDANCE["auto"])
+        if self.profile == "acdc-2026":
+            guidance += f" ACDC 2026 track ({self.track}): " + ACDC_GUIDANCE[self.track]
+            if self.challenge_mode == "koth":
+                guidance += " Record service state, attempted changes, and observed effects; do not assume a flag is the goal."
+            else:
+                guidance += " ACDC-shaped strings may be fragments or decoys. Verify transformations and provenance before concluding."
+        return guidance
+
+    def has_derived_candidate(self) -> bool:
+        return any(item.get("role", "candidate") == "candidate" and
+                   (item.get("source") in {"디코딩 결과", "격리 Python 실행 출력"} or
+                    str(item.get("source", "")).startswith(("아카이브 내부", "해시 계산:")))
+                   for item in self.evidence)
 
     def _record_flags(self, content: str, source: str) -> None:
         status = {
@@ -276,9 +382,47 @@ class Case:
               else "해시 계산으로 도출됨 (정답 미확인)" if source.startswith("해시 계산:")
               else "입력에서 관찰됨 (정답 미확인)")
         for flag in extract_flags(content, self.pattern):
-            record = {"flag": flag, "source": source, "status": status}
+            pos = content.find(flag)
+            line_start = content.rfind("\n", 0, pos) + 1
+            line_end = content.find("\n", pos)
+            context = content[line_start:line_end if line_end >= 0 else pos + len(flag) + 80][:240]
+            if re.search(r"\b(?:fake|dummy|decoy|not.real)\b|가짜|미끼", context, re.I):
+                role = "decoy"
+            elif re.search(r"\b(?:fragment|piece|part)\b|조각|일부", context, re.I):
+                role = "fragment"
+            else:
+                role = "candidate"
+            if role in {"fragment", "decoy"}:
+                for old in self.evidence:
+                    if old.get("flag") == flag:
+                        old["role"] = role
+            else:
+                role = next((old.get("role", "candidate") for old in self.evidence
+                             if old.get("flag") == flag and old.get("role") in {"fragment", "decoy"}), role)
+            record = {"flag": flag, "source": source, "status": status,
+                      "role": role}
             if record not in self.evidence:
                 self.evidence.append(record)
+
+    def _log_exchange(self, method: str, path: str, headers: dict | None,
+                      request_body: str, response: str) -> None:
+        safe_headers = {str(k): ("<redacted>" if re.search(r"authorization|cookie|api.key|token|secret", str(k), re.I)
+                                else str(v)[:512])
+                        for k, v in (headers or {}).items() if isinstance(k, str)}
+        safe_body = re.sub(r"(?i)\b(token|password|secret|api[_-]?key)=([^&\s]+)",
+                           r"\1=<redacted>", request_body[:4096])
+        safe_body = re.sub(r'(?i)("(?:token|password|secret|api[_-]?key)"\s*:\s*")[^"]*',
+                           r'\1<redacted>', safe_body)
+        entry = {"at": datetime.now().isoformat(timespec="seconds"),
+                 "method": method, "path": path[:500], "headers": safe_headers,
+                 "request_body_length": len(request_body),
+                 "request_body_sha256": hashlib.sha256(request_body.encode("utf-8", errors="replace")).hexdigest(),
+                 "request_body_preview": safe_body,
+                 "response": re.sub(r"(?im)^(set-cookie|authorization|x-api-key):[^\r\n]*",
+                                    r"\1: <redacted>", response[:3000])}
+        self.requests.append(entry)
+        with (self.root / "requests.jsonl").open("a", encoding="utf-8") as out:
+            out.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def _file(self, name: str) -> Path:
         path = self.files_dir / checked_name(name)
@@ -743,8 +887,11 @@ class Case:
                     conn.sendall(payload)
                     receive(conn)
         except (OSError, TimeoutError) as exc:
-            return f"문제 TCP 교환 실패: {type(exc).__name__}"
+            failure = f"문제 TCP 교환 실패: {type(exc).__name__}"
+            self._log_exchange("TCP", f"{host}:{port}", {}, "\n".join(steps), failure)
+            return failure
         output = b"".join(chunks).decode("utf-8", errors="replace")
+        self._log_exchange("TCP", f"{host}:{port}", {}, "\n".join(steps), output)
         self._record_flags(output, f"문제 서버: {host}:{port}")
         return output[:8192] or "문제 TCP 서버에서 출력이 없습니다."
 
@@ -795,7 +942,10 @@ class Case:
                 body = ""
             full_resp = f"HTTP {exc.code}\n{headers_str}\n\n{body}" if headers_str else f"HTTP {exc.code}\n{body}"
         except (URLError, TimeoutError, OSError) as exc:
-            return f"문제 웹 요청 실패: {type(exc).__name__}"
+            failure = f"문제 웹 요청 실패: {type(exc).__name__}"
+            self._log_exchange("GET", path, req_headers, "", failure)
+            return failure
+        self._log_exchange("GET", path, req_headers, "", full_resp)
         # ZIP entries were recorded with their precise archive path above.
         self._record_flags(headers_str if body.startswith("ZIP 파일 저장:") else full_resp,
                            f"문제 웹 응답: {path[:180]}")
@@ -852,7 +1002,10 @@ class Case:
                 body_resp = ""
             full_resp = f"HTTP {exc.code}\n{headers_str}\n\n{body_resp}" if headers_str else f"HTTP {exc.code}\n{body_resp}"
         except (URLError, TimeoutError, OSError) as exc:
-            return f"문제 웹 POST 요청 실패: {type(exc).__name__}"
+            failure = f"문제 웹 POST 요청 실패: {type(exc).__name__}"
+            self._log_exchange("POST", path, req_headers, body, failure)
+            return failure
+        self._log_exchange("POST", path, req_headers, body, full_resp)
         self._record_flags(full_resp, f"문제 웹 응답: {path[:180]}")
         return full_resp[:6500]
 
@@ -896,6 +1049,7 @@ class Case:
                         pass
 
             self.service_output = b"".join(chunks).decode("utf-8", errors="replace")
+            self._log_exchange("TCP banner/probe", f"{host}:{port}", {}, "", self.service_output)
             if self.service_output:
                 if self.service_output.startswith(("HTTP/1.0", "HTTP/1.1", "HTTP/2")):
                     self.web_origin = f"http://{host}:{port}"
@@ -914,16 +1068,20 @@ class Case:
     def finish(self, model: str, answer: str, transcript: list[dict], cost_usd: float | None = None) -> dict:
         for flag in extract_flags(answer, self.pattern):
             if not any(item["flag"] == flag for item in self.evidence):
-                self.evidence.append({"flag": flag, "source": "모델 답변", "status": "모델 후보 (정답 미확인)"})
+                self.evidence.append({"flag": flag, "source": "모델 답변", "status": "모델 후보 (정답 미확인)",
+                                      "role": "candidate"})
+        candidates = [item for item in self.evidence if item.get("role", "candidate") == "candidate"]
         remote_sources = ("문제 웹 응답:", "문제 서버:")
-        remote_flags = list(dict.fromkeys(item["flag"] for item in self.evidence
+        remote_flags = list(dict.fromkeys(item["flag"] for item in candidates
                                           if item["source"].startswith(remote_sources)))
-        other_flags = list(dict.fromkeys(item["flag"] for item in self.evidence
+        other_flags = list(dict.fromkeys(item["flag"] for item in candidates
                                          if item["flag"] not in remote_flags))
         if not remote_flags and not other_flags:
             answer = "정확한 flag를 확인하지 못했습니다. 예시 형식은 정답이 아닙니다.\n\n" + answer
         output = {"run_id": self.id, "model": model, "answer": answer,
-                  "flag_candidates": self.evidence, "steps": transcript,
+                  "flag_candidates": candidates, "flag_observations": self.evidence, "steps": transcript,
+                  "requests": self.requests, "parent_id": self.parent_id,
+                  "profile": self.profile, "track": self.track, "challenge_mode": self.challenge_mode,
                   "remote_observed_flags": remote_flags,
                   "other_candidates": other_flags,
                   "result_status": "remote_observed" if remote_flags else "candidate_only" if other_flags else "unresolved",
@@ -992,12 +1150,6 @@ class Case:
         if not 1 <= effective_steps <= step_limit:
             raise ValueError(f"최대 단계 수는 1~{step_limit}입니다.")
         self.read_service()
-        service_flags = [item for item in self.evidence
-                         if item["source"].startswith(("문제 서버:", "문제 웹 응답:"))]
-        if service_flags:
-            return self.finish(model, "문제 서버 출력에서 flag를 직접 확인했습니다: " +
-                               ", ".join(item["flag"] for item in service_flags), [],
-                               0.0 if model in OPENAI_MODELS else None)
         if model in OPENAI_MODELS:
             from ctf_openai import solve_openai
             return solve_openai(self, model, effective_steps)
@@ -1015,7 +1167,7 @@ class Case:
                 elif data.startswith(b"PK\x03\x04"): magic = "ZIP archive"
                 elif data.startswith(b"\x1f\x8b"): magic = "GZIP archive"
                 preview.append(f"### {p.name} [{magic}, {len(data)} bytes] (use analyze_binary or inspect_archive)")
-        guidance = CATEGORY_GUIDANCE.get(self.category, CATEGORY_GUIDANCE["auto"])
+        guidance = self.analysis_guidance()
         system_content = (
             f"You are a CTF study assistant for category: {self.category}. {guidance} "
             "Analyze only the supplied problem, local files, and explicit CTF endpoint. "
@@ -1029,12 +1181,14 @@ class Case:
             "Use http_get and http_post only when a CTF web origin was explicitly supplied, and only for evidence needed to solve it. "
             "If a CTF TCP endpoint was explicitly supplied, use tcp_exchange to inspect its menu and test a reasoned input sequence. "
             "Treat strings marked Fake_Flag, dummy, or decoy as known non-answers; do not stop on them. "
+            "Strings observed in a file or banner can be fragments or decoys; verify their role before concluding. "
             "Never present a placeholder such as DH{...} as a candidate. There is no official flag submission." )
         messages = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": "문제 설명:\n" + self.description +
              "\n\n문제 서버 출력:\n" + (self.service_output or "제공되지 않음") +
-             "\n\n입력 파일:\n" + self.list_files() + "\n\n텍스트 미리보기:\n" + "\n".join(preview)[:8500]}
+             "\n\n입력 파일:\n" + self.list_files() + "\n\n텍스트 미리보기:\n" + "\n".join(preview)[:8500]
+             + self.continuation_context}
         ]
         transcript = []
         answer = ""
@@ -1069,7 +1223,10 @@ class Case:
 
             if content:
                 for flag in extract_flags(content, self.pattern):
-                    record = {"flag": flag, "source": "모델 추론", "status": "모델 추론으로 도출됨 (정답 미확인)"}
+                    role = next((item.get("role", "candidate") for item in self.evidence
+                                 if item.get("flag") == flag and item.get("role") in {"fragment", "decoy"}), "candidate")
+                    record = {"flag": flag, "source": "모델 추론", "status": "모델 추론으로 도출됨 (정답 미확인)",
+                              "role": role}
                     if record not in self.evidence:
                         self.evidence.append(record)
 
@@ -1078,9 +1235,8 @@ class Case:
             transcript.append({"turn": turn+1, "content": content,
                                "tools": [c.get("function", {}).get("name") for c in calls]})
             if not calls:
-                has_flag = any(item.get("flag") for item in self.evidence)
                 tcp_untested = bool(self.tcp_endpoint and self.tcp_requests == 0)
-                if (has_flag and not tcp_untested) or turn >= effective_steps - 1 or no_call_retries >= 2:
+                if (self.has_derived_candidate() and not tcp_untested) or turn >= effective_steps - 1 or no_call_retries >= 2:
                     answer = content or "모델이 답변을 생성하지 못했습니다."
                     break
 
@@ -1089,7 +1245,7 @@ class Case:
                 messages.append({
                     "role": "user",
                     "content": (
-                        "입력의 Fake_Flag 등 미끼는 실제 정답이 아닙니다. "
+                        "발견된 문자열이 실제 정답인지, 조각 또는 미끼인지 아직 확인되지 않았습니다. "
                         + ("사용자가 지정한 CTF TCP 서버에서 tcp_exchange로 메뉴와 입력 결과를 확인하세요. "
                            if tcp_untested else "")
                         + "inspect_elf, disassemble_function, search_binary_strings 등 사용 가능한 도구로 "
@@ -1143,7 +1299,15 @@ def main() -> None:
     solve.add_argument("--docker-python", action="store_true")
     solve.add_argument("--tcp-endpoint", help="선택: 문제 서버 host:port에서 배너 한 번 읽기")
     solve.add_argument("--category", choices=CHALLENGE_CATEGORIES, default="auto", help="CTF 분야")
+    solve.add_argument("--profile", choices=PROFILES, default="general", help="대회 프로필")
+    solve.add_argument("--track", choices=ACDC_TRACKS, default="auto", help="ACDC AI 보안 영역")
+    solve.add_argument("--challenge-mode", choices=CHALLENGE_MODES, default="ctf", help="CTF 또는 KotH")
     solve.add_argument("--allow-mismatch", action="store_true", help="문제 설명과 첨부 파일의 Flag 형식이 달라도 분석")
+    cont = sub.add_parser("continue", help="저장된 문제에 새 관찰을 추가해 이어 분석")
+    cont.add_argument("run_id", help="이어 분석할 이전 실행 ID")
+    cont.add_argument("--note", required=True, help="새 서버 응답, 실패 기록 또는 추가 단서")
+    cont.add_argument("--model", default=DEFAULT_MODEL)
+    cont.add_argument("--max-steps", type=int, default=None)
     web = sub.add_parser("serve", help="로컬 웹 화면 시작")
     web.add_argument("--no-browser", action="store_true", help="브라우저 자동 열기 생략")
     args = p.parse_args()
@@ -1151,17 +1315,21 @@ def main() -> None:
         from ctf_helper_web import serve
         serve(open_browser=not args.no_browser)
         return
-    if bool(args.problem) == bool(args.problem_file):
-        p.error("--problem 또는 --problem-file 중 하나를 지정하세요.")
-    description = args.problem if args.problem else args.problem_file.read_text(encoding="utf-8")
-    files = []
-    for path in args.file:
-        if path.stat().st_size > MAX_FILE_BYTES:
-            p.error(f"파일 하나는 8 MiB 이하로 지정하세요: {path}")
-        files.append((path.name, path.read_bytes()))
-    case = Case(description, files, args.flag_regex, args.docker_python,
-                event=lambda msg: print(msg, flush=True), tcp_endpoint=args.tcp_endpoint,
-                category=args.category, allow_mismatch=args.allow_mismatch)
+    if args.command == "continue":
+        case = Case.from_run(args.run_id, args.note, event=lambda msg: print(msg, flush=True))
+    else:
+        if bool(args.problem) == bool(args.problem_file):
+            p.error("--problem 또는 --problem-file 중 하나를 지정하세요.")
+        description = args.problem if args.problem else args.problem_file.read_text(encoding="utf-8")
+        files = []
+        for path in args.file:
+            if path.stat().st_size > MAX_FILE_BYTES:
+                p.error(f"파일 하나는 8 MiB 이하로 지정하세요: {path}")
+            files.append((path.name, path.read_bytes()))
+        case = Case(description, files, args.flag_regex, args.docker_python,
+                    event=lambda msg: print(msg, flush=True), tcp_endpoint=args.tcp_endpoint,
+                    category=args.category, allow_mismatch=args.allow_mismatch,
+                    profile=args.profile, track=args.track, challenge_mode=args.challenge_mode)
     try:
         result = case.solve(args.model, args.max_steps)
     except Exception as exc:

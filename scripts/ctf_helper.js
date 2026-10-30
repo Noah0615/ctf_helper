@@ -1,4 +1,5 @@
 const $ = id => document.getElementById(id);
+let currentRunId = null;
 
 const CATEGORY_HINTS = {
   auto: "문제 설명과 첨부 파일을 분석하여 최적의 분석 흐름을 자동으로 결정합니다.",
@@ -94,6 +95,10 @@ $('reset-btn').addEventListener('click', () => {
   $('flags').replaceChildren();
   $('answer').textContent = '';
   $('events').textContent = '';
+  $('request-log').textContent = '';
+  $('continue-panel').hidden = true;
+  $('continue-note').value = '';
+  currentRunId = null;
 });
 
 // Copy full report
@@ -178,11 +183,12 @@ async function health() {
 async function poll(id) {
   const r = await (await fetch(`/api/job/${encodeURIComponent(id)}`)).json();
   const items = r.result?.flag_candidates || [];
+  const observations = r.result?.flag_observations || [];
   const remote = items.filter(item => item.source.startsWith('문제 웹 응답:') || item.source.startsWith('문제 서버:'));
   const remoteValues = new Set(remote.map(item => item.flag));
   const others = items.filter(item => !remoteValues.has(item.flag));
   $('status').textContent = r.status === 'done'
-    ? (remote.length ? '분석 완료 · 문제 서버 응답에서 플래그 확인'
+    ? (remote.length ? '분석 완료 · 문제 서버에서 후보 문자열 관찰'
        : others.length ? '분석 완료 · 미검증 후보 발견' : '분석 완료 · 정확한 flag 미확인')
     : `상태: ${r.status}`;
   $('events').textContent = (r.events || []).join('\n');
@@ -225,7 +231,9 @@ async function poll(id) {
     }
     addGroup('문제 서버 응답에서 확인한 값', remote);
     addGroup('추가 후보 · 공식 채점 미확인', others);
-    if (!items.length) $('flags').textContent = '확인된 flag가 없습니다. 문제 주소와 첨부 파일을 확인하세요.';
+    addGroup('조각 · 변환 또는 결합 필요', observations.filter(item => item.role === 'fragment'));
+    addGroup('미끼로 표시된 문자열', observations.filter(item => item.role === 'decoy'));
+    if (!observations.length && !items.length) $('flags').textContent = '관찰된 flag 형식 문자열이 없습니다. 문제 주소와 첨부 파일을 확인하세요.';
 
     if (r.result.cost_usd !== undefined) {
       $('cost').hidden = false;
@@ -236,9 +244,15 @@ async function poll(id) {
     }
 
     $('answer').textContent = r.result.answer + `\n\n실행 ID: ${r.result.run_id}`;
+    if (r.result.parent_id) $('answer').textContent += `\n이전 실행 ID: ${r.result.parent_id}`;
+    $('request-log').textContent = (r.result.requests || []).map(entry =>
+      `${entry.at} ${entry.method} ${entry.path}\n${entry.request_body_preview || ''}\n${entry.response}`).join('\n\n') || '이 실행에서 기록된 요청이 없습니다.';
+    currentRunId = r.result.run_id;
+    $('continue-panel').hidden = false;
+    $('continue-btn').disabled = false;
     $('submit').disabled = false;
     health();
-loadHistory();
+    loadHistory();
   } else if (r.status === 'failed') {
     $('answer').textContent = `분석 실패: ${r.error}`;
     $('submit').disabled = false;
@@ -249,6 +263,8 @@ loadHistory();
 
 $('form').addEventListener('submit', async event => {
   event.preventDefault();
+  currentRunId = null;
+  $('continue-panel').hidden = true;
   $('submit').disabled = true;
   $('result').hidden = false;
   $('cost').hidden = true;
@@ -287,6 +303,9 @@ $('form').addEventListener('submit', async event => {
         files,
         model: $('model').value,
         category: $('category').value,
+        profile: $('profile').value,
+        track: $('track').value,
+        challenge_mode: $('challenge-mode').value,
         tcp_endpoint: $('tcp-endpoint').value.trim(),
         allow_mismatch: Boolean($('allow-mismatch')?.checked),
         flag_regex: $('regex').value,
@@ -300,6 +319,32 @@ $('form').addEventListener('submit', async event => {
     $('status').textContent = '시작 실패';
     $('answer').textContent = e.message;
     $('submit').disabled = false;
+  }
+});
+
+$('continue-btn').addEventListener('click', async () => {
+  const note = $('continue-note').value.trim();
+  if (!currentRunId || !note) {
+    $('status').textContent = '이전 결과와 추가 관찰을 입력하세요.';
+    return;
+  }
+  $('continue-btn').disabled = true;
+  $('status').textContent = '이전 분석 기록을 불러오는 중…';
+  try {
+    const response = await fetch('/api/continue', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({run_id: currentRunId, note, model: $('model').value})
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error);
+    $('continue-note').value = '';
+    $('continue-panel').hidden = true;
+    $('events').textContent = '';
+    poll(result.job_id);
+  } catch (e) {
+    $('status').textContent = '이어 분석 시작 실패';
+    $('answer').textContent = e.message;
+    $('continue-btn').disabled = false;
   }
 });
 
