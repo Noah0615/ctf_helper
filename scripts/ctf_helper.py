@@ -290,6 +290,8 @@ TOOLS = [
                 {"name": {"type": "string"}}, ["name"]),
     tool_schema("craft_prompt_injections", "Generate battle-tested prompt injection and jailbreak payloads (direct override, refusal suppression, encoding bypass, delimiter escape) for LLM CTF targets",
                 {"goal": {"type": "string"}, "defense_hint": {"type": "string"}, "target_service": {"type": "string"}}, []),
+    tool_schema("search_past_runs", "Search past CTF analysis runs, discovered flags, endpoints, and solution scripts by keyword or problem title to reference previous models' findings",
+                {"query": {"type": "string"}}, ["query"]),
     tool_schema("predict_objectid", "Analyze a JSON array or text of MongoDB documents to predict hidden/secret document ObjectIds by interpolating timestamps, machine IDs, and sequential counters (MongoDB < 4.0.0)",
                 {"data": {"type": "string"}, "endpoint_template": {"type": "string"}}, ["data"]),
     tool_schema("craft_pickle_exploit", "Generate PyTorch / Pickle deserialization RCE exploit payloads (using __reduce__) for CTF challenges where torch.load or pickle.loads is executed",
@@ -1077,6 +1079,9 @@ class Case:
                 result = craft_prompt_injections(str(args.get("goal", "leak_flag")),
                                                 str(args.get("defense_hint", "")),
                                                 str(args.get("target_service", "http")))
+            elif name == "search_past_runs":
+                from ctf_knowledge import search_past_runs
+                result = search_past_runs(str(args.get("query", "")))
             elif name == "predict_objectid":
                 from ctf_category_tools import analyze_mongodb_objectids
                 data_in = str(args.get("data", ""))
@@ -1602,7 +1607,26 @@ class Case:
             "If you derive a reusable solution, save its code with save_solution_script; prioritize obtaining the actual result first. "
             "Treat strings marked Fake_Flag, dummy, or decoy as known non-answers; do not stop on them. "
             "Strings observed in a file or banner can be fragments or decoys; verify their role before concluding. "
-            "Never present a placeholder such as DH{...} as a candidate. There is no official flag submission." )
+            "You can use search_past_runs to look up previous CTF writeups and solutions. When past run findings from other models are referenced, verify them and build upon them. Never present a placeholder such as DH{...} as a candidate. There is no official flag submission." )
+        if not self.continuation_context:
+            try:
+                from ctf_knowledge import find_related_runs, format_past_runs_knowledge
+                file_names = [f[0] for f in self.iter_files()]
+                related = find_related_runs(self.description, file_names, self.web_origin, self.id)
+                if related:
+                    knowledge_text = format_past_runs_knowledge(related)
+                    self.continuation_context += knowledge_text
+                    for r in related:
+                        for f_cand in r.get("flags", []):
+                            self._record_flags(f_cand, f"이전 분석 기록 ({r['model']})")
+                        for s in r.get("scripts_data", []):
+                            if isinstance(s, dict) and s.get("name") and s.get("code"):
+                                try:
+                                    self.save_solution_script(s["name"], s["code"])
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
         messages = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": "문제 설명:\n" + self.description +

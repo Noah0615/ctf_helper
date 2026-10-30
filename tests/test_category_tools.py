@@ -277,5 +277,22 @@ class TestCategoryTools(unittest.TestCase):
             server.shutdown()
 
 
+
+    def test_search_past_runs(self):
+        from ctf_knowledge import search_past_runs, RESULTS_DIR
+        if not RESULTS_DIR.is_dir() or not any((f / "result.json").is_file() for f in RESULTS_DIR.iterdir() if f.is_dir()):
+            self.skipTest("No past runs available on disk")
+        res = search_past_runs("Stream")
+        self.assertIn("과거 분석 기록 검색 결과", res)
+
+    def test_search_past_runs_via_case(self):
+        from ctf_knowledge import RESULTS_DIR
+        if not RESULTS_DIR.is_dir() or not any((f / "result.json").is_file() for f in RESULTS_DIR.iterdir() if f.is_dir()):
+            self.skipTest("No past runs available on disk")
+        case = helper.Case("Search past test", [])
+        res = case.call_tool("search_past_runs", {"query": "DH{"})
+        self.assertIn("과거 분석 기록 검색 결과", res)
+
+
 if __name__ == '__main__':
     unittest.main()
