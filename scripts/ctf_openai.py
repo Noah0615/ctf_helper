@@ -139,7 +139,7 @@ def _openai_tools(allow_http: bool = True, allow_tcp: bool = True) -> list[dict]
              "description": tool["function"]["description"],
              "parameters": tool["function"]["parameters"], "strict": False}
             for tool in TOOLS if (allow_http or tool["function"]["name"] not in {
-                "http_get", "http_post", "http_prefix_oracle", "http_integer_oracle"})
+             "http_get", "http_post", "http_multipart_post", "http_prefix_oracle", "http_integer_oracle"})
             and (allow_tcp or tool["function"]["name"] != "tcp_exchange")]
 
 
@@ -187,6 +187,7 @@ def solve_openai(case, model: str, max_steps: int) -> dict:
         "If a CTF web origin was explicitly supplied, use http_get and http_post to inspect that origin and verify evidence. "
         "When source code exposes a bounded prefix or integer oracle, use http_prefix_oracle or http_integer_oracle "
         "to finish the search against the supplied CTF origin. Do not stop at pseudocode when the tool can complete it. "
+         "For an image or file-upload challenge, binary http_get responses are saved as run files. Offline Python may write result files only to /output; they appear as artifacts/ and can be submitted only to the same supplied CTF origin with http_multipart_post. "
         "When useful, save a reproducible script with save_solution_script after obtaining evidence; prioritize the actual result. "
         "For pwn/reversing use inspect_elf, disassemble_function and targeted binary strings; never execute uploaded native binaries. "
         "For forensics use analyze_binary, inspect_archive, and read_archive_entry; for crypto use decode_text, extract_crypto_params, and offline Python calculations. For AI security (ai-security), use inspect_ai_model to check SafeTensors/GGUF metadata and PyTorch/pickle bytecode for hidden flags or RCE; use craft_prompt_injections for LLM jailbreak and system prompt extraction; use craft_pickle_exploit for torch.load / pickle.loads targets. "

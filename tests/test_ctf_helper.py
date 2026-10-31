@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 from urllib.parse import parse_qs
+from urllib.error import HTTPError
 import sys
 import tempfile
 import time
@@ -403,6 +404,39 @@ class HelperTests(unittest.TestCase):
         self.assertIn("HTTP 200", output)
         self.assertIn("Set-Cookie: flag=ACDC{cookie_flag}", output)
         self.assertTrue(any("ACDC{cookie_flag}" in item["flag"] for item in case.evidence))
+
+    def test_http_error_binary_download_and_multipart_artifact_submission(self):
+        case = helper.Case("Web upload", [], tcp_endpoint="http://ctf.example:8000/")
+        missing = HTTPError("http://ctf.example:8000/missing", 404, "missing", {}, io.BytesIO(b"not found"))
+        with patch.object(helper, "build_opener") as opener:
+            opener.return_value.open.side_effect = missing
+            output = case.http_get("/missing")
+        self.assertIn("HTTP 404", output)
+
+        binary_response = MagicMock()
+        binary_response.status = 200
+        binary_response.headers = {"Content-Type": "image/png"}
+        binary_response.read.return_value = b"\x89PNG\r\n\x1a\nimage-data"
+        with patch.object(helper, "build_opener") as opener:
+            opener.return_value.open.return_value.__enter__.return_value = binary_response
+            output = case.http_get("/damaged1.png")
+        self.assertIn("remote_damaged1.png", output)
+        self.assertEqual(case._file("remote_damaged1.png").read_bytes(), binary_response.read.return_value)
+
+        artifact = case.artifacts_dir / "restored1.png"
+        artifact.write_bytes(binary_response.read.return_value)
+        submitted = MagicMock()
+        submitted.status = 201
+        submitted.headers = {"Content-Type": "application/json"}
+        submitted.read.return_value = b'{"flag":"ACDC{multipart_ok}"}'
+        with patch.object(helper, "build_opener") as opener:
+            opener.return_value.open.return_value.__enter__.return_value = submitted
+            result = case.http_multipart_post("/submit", {"file1": "artifacts/restored1.png"})
+            request = opener.return_value.open.call_args.args[0]
+        self.assertIn("HTTP 201", result)
+        self.assertIn(b'name="file1"', request.data)
+        self.assertIn(b"image-data", request.data)
+        self.assertTrue(any("ACDC{multipart_ok}" in item["flag"] for item in case.evidence))
 
     def test_reversing_and_forensics_tools_do_not_execute_uploaded_files(self):
         blob = io.BytesIO()

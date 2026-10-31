@@ -8,6 +8,7 @@ from collections import Counter
 from datetime import datetime
 import json
 import hashlib
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -50,6 +51,10 @@ MAX_DESCRIPTION = 16000
 MAX_DIRECT_HTTP_REQUESTS = 8
 MAX_BATCH_HTTP_REQUESTS = 300
 MAX_BATCH_SECONDS = 300
+MAX_REMOTE_DOWNLOADS = 16
+MAX_REMOTE_DOWNLOAD_BYTES = 64 * 1024 * 1024
+MAX_ARTIFACT_FILES = 16
+MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 DECLARED_FLAG_FORMAT = re.compile(
     r"(?:flag\s*format|플래그(?:의)?\s*형식)\s*(?:[:：은는]\s*)?[`* ]*([A-Za-z][A-Za-z0-9_]{1,23})\s*\{",
     re.IGNORECASE,
@@ -247,7 +252,7 @@ TOOLS = [
                 {"term": {"type": "string"}}, ["term"]),
     tool_schema("decode_text", "Try base64, base32, base85, hex, URL decode, ROT13/Caesar, and binary decoding of a string",
                 {"text": {"type": "string"}}, ["text"]),
-    tool_schema("run_python", "Run a short Python 3 calculation in an offline Docker sandbox; challenge files are read-only under /challenge",
+    tool_schema("run_python", "Run a short Python 3 calculation in an offline Docker sandbox; challenge files are read-only under /challenge. Generated result files may be written only to /output and are listed as artifacts/ afterward.",
                 {"code": {"type": "string"}}, ["code"]),
     tool_schema("save_solution_script", "Save a reproducible exploit or analysis script in this run's local results without executing it. Obtain and verify a flag with the available tools when possible.",
                 {"name": {"type": "string"}, "code": {"type": "string"}}, ["name", "code"]),
@@ -256,6 +261,9 @@ TOOLS = [
     tool_schema("http_post", "POST data to one path on the explicitly supplied CTF web origin; returns status, response headers, and body",
                 {"path": {"type": "string"}, "body": {"type": "string"}, "content_type": {"type": "string"},
                  "headers": {"type": "object", "additionalProperties": {"type": "string"}}}, ["path"]),
+    tool_schema("http_multipart_post", "Submit up to eight existing input or artifacts/ files as multipart/form-data to one path on the explicitly supplied CTF web origin. Use this for challenge upload forms; it never uploads files outside this run.",
+                {"path": {"type": "string"}, "file_fields": {"type": "object", "additionalProperties": {"type": "string"}},
+                 "fields": {"type": "object", "additionalProperties": {"type": "string"}}}, ["path", "file_fields"]),
     tool_schema("http_prefix_oracle", "Recover a short unknown string one character at a time from a positive POST response marker on the supplied CTF web origin; up to 300 total batch requests. Use when source shows a prefix oracle instead of stopping with pseudocode.",
                 {"path": {"type": "string"}, "field": {"type": "string"}, "alphabet": {"type": "string"},
                  "length": {"type": "integer"}, "success_marker": {"type": "string"},
@@ -369,6 +377,8 @@ class Case:
         self.root = RESULTS / self.id
         self.files_dir = self.root / "files"
         self.files_dir.mkdir(parents=True, exist_ok=False)
+        self.artifacts_dir = self.root / "artifacts"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=False)
         self.description = description
         self.docker_python = docker_python
         self.event = event or (lambda message: None)
@@ -545,20 +555,34 @@ class Case:
             out.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def _file(self, name: str) -> Path:
-        path = self.files_dir.joinpath(*checked_relative_path(name).split("/"))
+        safe_name = checked_relative_path(name)
+        if safe_name.startswith("artifacts/"):
+            root = self.artifacts_dir
+            relative = safe_name.removeprefix("artifacts/")
+        else:
+            root = self.files_dir
+            relative = safe_name
+        if not relative:
+            raise ValueError("해당 입력 파일이 없습니다.")
+        path = root.joinpath(*relative.split("/"))
         if (not path.is_file() or path.is_symlink() or
-                not path.resolve().is_relative_to(self.files_dir.resolve())):
+                not path.resolve().is_relative_to(root.resolve())):
             raise ValueError("해당 입력 파일이 없습니다.")
         return path
 
     def iter_files(self) -> list[Path]:
-        root = self.files_dir.resolve()
-        return sorted((p for p in self.files_dir.rglob("*")
-                       if p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(root)),
-                      key=lambda p: p.relative_to(self.files_dir).as_posix().casefold())
+        items: list[Path] = []
+        for directory in (self.files_dir, self.artifacts_dir):
+            root = directory.resolve()
+            items.extend(p for p in directory.rglob("*")
+                         if p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(root))
+        return sorted(items, key=lambda p: self.file_label(p).casefold())
 
     def file_label(self, path: Path) -> str:
-        return path.relative_to(self.files_dir).as_posix()
+        try:
+            return path.relative_to(self.files_dir).as_posix()
+        except ValueError:
+            return "artifacts/" + path.relative_to(self.artifacts_dir).as_posix()
 
     def list_files(self) -> str:
         return json.dumps([{"name": self.file_label(p), "bytes": p.stat().st_size}
@@ -902,7 +926,41 @@ class Case:
                     f"flag_candidates: {json.dumps(observed, ensure_ascii=False)}")
         if is_text(raw):
             return raw[:64 * 1024].decode("utf-8", errors="replace")
-        return f"바이너리 응답 ({len(raw)} bytes, 첫 32바이트: {raw[:32].hex()})"
+        if len(raw) > MAX_FILE_BYTES:
+            return f"바이너리 응답이 {MAX_FILE_BYTES}바이트 제한을 초과하여 저장하지 않았습니다."
+        existing = [p for p in self.files_dir.glob("remote_*") if p.is_file()]
+        existing_bytes = sum(p.stat().st_size for p in existing)
+        if len(existing) >= MAX_REMOTE_DOWNLOADS or existing_bytes + len(raw) > MAX_REMOTE_DOWNLOAD_BYTES:
+            return "바이너리 응답 저장 한도(16개, 합계 64 MiB)에 도달했습니다."
+        requested_name = urlsplit(path).path.rsplit("/", 1)[-1] or "download.bin"
+        try:
+            name = checked_name("remote_" + requested_name)
+        except ValueError:
+            name = "remote_download.bin"
+        if (self.files_dir / name).exists():
+            stem, suffix = os.path.splitext(name)
+            name = f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+        target = self.files_dir / name
+        target.write_bytes(raw)
+        return (f"바이너리 응답 저장: {name} ({len(raw)} bytes, SHA256: "
+                f"{hashlib.sha256(raw).hexdigest()})\n첫 32바이트: {raw[:32].hex()}\n"
+                "이 파일은 read_file, analyze_binary 또는 격리 Python(/challenge)에서 사용할 수 있습니다.")
+
+    def _artifact_report(self) -> str:
+        files = []
+        total = 0
+        root = self.artifacts_dir.resolve()
+        for item in sorted(self.artifacts_dir.rglob("*")):
+            if not item.is_file() or item.is_symlink() or not item.resolve().is_relative_to(root):
+                continue
+            size = item.stat().st_size
+            if size > MAX_FILE_BYTES:
+                continue
+            total += size
+            if total > MAX_ARTIFACT_BYTES or len(files) >= MAX_ARTIFACT_FILES:
+                break
+            files.append(f"artifacts/{item.relative_to(self.artifacts_dir).as_posix()} ({size} bytes)")
+        return "생성 결과물: " + (", ".join(files) if files else "없음")
 
     def hash_calc(self, text: str = "", file_name: str = "") -> str:
         import hashlib
@@ -930,6 +988,7 @@ class Case:
         if not shutil.which("docker"):
             return "Docker 명령을 찾을 수 없습니다. Python 실행 없이 파일 분석을 계속하세요."
         mount = f"type=bind,src={self.files_dir.resolve()},dst=/challenge,readonly"
+        output_mount = f"type=bind,src={self.artifacts_dir.resolve()},dst=/output"
         container_name = "ctf-helper-" + uuid.uuid4().hex[:12]
         crypto_shim = (
             "import sys, types, math\n"
@@ -954,7 +1013,7 @@ class Case:
                    "--pull=never", "--network=none", "--read-only",
                    "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=64",
                    "--memory=512m", "--cpus=1", "--user=65534:65534", "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
-                   "--mount", mount, "--workdir=/challenge", "python:3.11-alpine", "python", "-c", crypto_shim + code]
+                   "--mount", mount, "--mount", output_mount, "--workdir=/challenge", "python:3.11-alpine", "python", "-c", crypto_shim + code]
         try:
             proc = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                                   errors="replace", timeout=20)
@@ -967,14 +1026,14 @@ class Case:
         if proc.returncode and "No such image" in output:
             return "격리 이미지가 없습니다. 한 번만 `docker pull python:3.11-alpine`을 실행한 후 다시 시도하세요."
         self._record_flags(output, "격리 Python 실행 출력")
-        return f"exit={proc.returncode}\n{output}"
+        return f"exit={proc.returncode}\n{output}\n{self._artifact_report()}"
 
     def call_tool(self, name: str, args: dict) -> str:
         if not isinstance(args, dict):
             return "도구 인수가 JSON 객체가 아닙니다."
 
         args_key = json.dumps(args, sort_keys=True, ensure_ascii=False)
-        if hasattr(self, "tool_history") and name in {"tcp_exchange", "http_get", "http_post"}:
+        if hasattr(self, "tool_history") and name in {"tcp_exchange", "http_get", "http_post", "http_multipart_post"}:
             for prev_name, prev_key, prev_res in reversed(self.tool_history[-4:]):
                 if prev_name == name and prev_key == args_key:
                     return (
@@ -1004,6 +1063,8 @@ class Case:
                 result = self.http_post(str(args["path"]), str(args.get("body", "")),
                                        str(args.get("content_type", "application/x-www-form-urlencoded")),
                                        args.get("headers"))
+            elif name == "http_multipart_post":
+                result = self.http_multipart_post(str(args["path"]), args.get("file_fields"), args.get("fields"))
             elif name == "http_prefix_oracle":
                 result = self.http_prefix_oracle(str(args["path"]), str(args["field"]),
                                                 str(args["alphabet"]), int(args["length"]),
@@ -1211,6 +1272,7 @@ class Case:
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
         req_headers = {"User-Agent": "CTF-Helper/1.0"}
+        status: int | None = None
         if isinstance(headers, dict):
             for k, v in headers.items():
                 if isinstance(k, str) and isinstance(v, str) and len(k) < 64 and len(v) < 512:
@@ -1230,6 +1292,7 @@ class Case:
                 body = self._http_get_body(path, response.read(MAX_FILE_BYTES + 1))
                 full_resp = f"HTTP {status}\n{headers_str}\n\n{body}" if headers_str else f"HTTP {status}\n{body}"
         except HTTPError as exc:
+            status = exc.code
             headers_list = []
             if hasattr(exc, "headers") and hasattr(exc.headers, "items"):
                 try:
@@ -1297,6 +1360,7 @@ class Case:
             "User-Agent": "CTF-Helper/1.0",
             "Content-Type": content_type or "application/x-www-form-urlencoded"
         }
+        status: int | None = None
         if isinstance(headers, dict):
             for k, v in headers.items():
                 if isinstance(k, str) and isinstance(v, str) and len(k) < 64 and len(v) < 512:
@@ -1316,6 +1380,7 @@ class Case:
                 body_resp = response.read(64 * 1024).decode("utf-8", errors="replace")
                 full_resp = f"HTTP {status}\n{headers_str}\n\n{body_resp}" if headers_str else f"HTTP {status}\n{body_resp}"
         except HTTPError as exc:
+            status = exc.code
             headers_list = []
             if hasattr(exc, "headers") and hasattr(exc.headers, "items"):
                 try:
@@ -1335,6 +1400,82 @@ class Case:
         self._log_exchange("POST", path, req_headers, body, full_resp)
         self._record_flags(full_resp, f"문제 웹 응답: {path[:180]}")
         return full_resp if _batch else full_resp[:6500]
+
+    def http_multipart_post(self, path: str, file_fields: dict, fields: dict | None = None) -> str:
+        """Submit explicitly selected run files to the supplied CTF origin only."""
+        if not self.web_origin:
+            return "문제 웹 주소가 입력되지 않았습니다."
+        if self.http_direct_requests >= MAX_DIRECT_HTTP_REQUESTS:
+            return "일반 웹 요청은 최대 8회입니다."
+        parsed = urlsplit(path)
+        if not path.startswith("/") or parsed.scheme or parsed.netloc or "#" in path:
+            return "경로는 / 로 시작하는 동일 서버의 상대 경로만 허용됩니다."
+        if not isinstance(file_fields, dict) or not 1 <= len(file_fields) <= 8:
+            return "file_fields에는 1~8개의 필드와 현재 실행 파일 경로를 지정하세요."
+        if fields is not None and (not isinstance(fields, dict) or len(fields) > 16):
+            return "fields는 최대 16개의 텍스트 필드여야 합니다."
+        field_name = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+        parts: list[bytes] = []
+        boundary = "----CTFHelper" + uuid.uuid4().hex
+        total = 0
+        selected: list[str] = []
+
+        def append_text(name: str, value: str) -> None:
+            if not field_name.fullmatch(name) or len(value) > 16 * 1024:
+                raise ValueError("multipart 텍스트 필드가 올바르지 않습니다.")
+            parts.extend([
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode("utf-8"), b"\r\n",
+            ])
+
+        try:
+            for name, value in (fields or {}).items():
+                append_text(str(name), str(value))
+            for name, value in file_fields.items():
+                if not field_name.fullmatch(str(name)):
+                    raise ValueError("multipart 파일 필드명이 올바르지 않습니다.")
+                source = self._file(str(value))
+                data = source.read_bytes()
+                total += len(data)
+                if total > MAX_FILE_BYTES:
+                    raise ValueError("multipart 파일 합계는 32 MiB 이하여야 합니다.")
+                content_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+                parts.extend([
+                    f"--{boundary}\r\n".encode(),
+                    (f'Content-Disposition: form-data; name="{name}"; filename="{source.name}"\r\n').encode(),
+                    f"Content-Type: {content_type}\r\n\r\n".encode(), data, b"\r\n",
+                ])
+                selected.append(self.file_label(source))
+        except (OSError, ValueError) as exc:
+            return f"multipart 준비 실패: {exc}"
+        payload = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        self.http_requests += 1
+        self.http_direct_requests += 1
+        self.event("문제 웹 multipart POST 요청: " + path[:180])
+        req_headers = {"User-Agent": "CTF-Helper/1.0", "Content-Type": f"multipart/form-data; boundary={boundary}"}
+        class NoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        try:
+            request = Request(self.web_origin + path, data=payload, headers=req_headers, method="POST")
+            opener = build_opener(HTTPCookieProcessor(self.cookie_jar), NoRedirect())
+            with opener.open(request, timeout=15) as response:
+                status = response.status
+                headers_str = "\n".join(f"{k}: {v}" for k, v in response.headers.items())
+                body_resp = self._http_get_body(path, response.read(MAX_FILE_BYTES + 1))
+        except HTTPError as exc:
+            status = exc.code
+            headers_str = "\n".join(f"{k}: {v}" for k, v in exc.headers.items()) if exc.headers else ""
+            body_resp = self._http_get_body(path, exc.read(MAX_FILE_BYTES + 1))
+        except (URLError, TimeoutError, OSError) as exc:
+            failure = f"문제 웹 multipart POST 요청 실패: {type(exc).__name__}"
+            self._log_exchange("POST", path, req_headers, f"multipart files: {selected}", failure)
+            return failure
+        full_resp = f"HTTP {status}\n{headers_str}\n\n{body_resp}" if headers_str else f"HTTP {status}\n{body_resp}"
+        self._log_exchange("POST", path, req_headers, f"multipart files: {selected}", full_resp)
+        self._record_flags(full_resp, f"문제 웹 응답: {path[:180]}")
+        return full_resp[:6500]
 
     def _oracle_form(self, path: str, field: str, marker: str, fixed_fields: dict | None) -> dict[str, str]:
         if not self.web_origin:
@@ -1652,8 +1793,8 @@ class Case:
         transcript = []
         answer = ""
         active_tools = [tool for tool in TOOLS
-                        if (self.web_origin or tool["function"]["name"] not in {
-                            "http_get", "http_post", "http_prefix_oracle", "http_integer_oracle"})
+                         if (self.web_origin or tool["function"]["name"] not in {
+                             "http_get", "http_post", "http_multipart_post", "http_prefix_oracle", "http_integer_oracle"})
                         and (self.tcp_endpoint or tool["function"]["name"] != "tcp_exchange")]
         no_call_retries = 0
 
